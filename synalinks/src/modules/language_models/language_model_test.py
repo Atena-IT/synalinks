@@ -555,6 +555,50 @@ class LanguageModelTest(testing.TestCase):
         self.assertNotIn("think", mock_completion.call_args.kwargs)
 
     @patch("litellm.acompletion")
+    async def test_reasoning_effort_disable_sends_each_providers_off_switch(
+        self, mock_completion
+    ):
+        """A model reasoning by default gets its provider's off switch, or its
+        lowest effort when it cannot stop reasoning; a non-reasoner, nothing.
+        """
+        mock_completion.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        messages = ChatMessages(
+            messages=[ChatMessage(role=ChatRole.USER, content="Hello")]
+        )
+        expected = {
+            "anthropic/claude-sonnet-5": {"thinking": {"type": "disabled"}},
+            "anthropic/claude-opus-5-5": {"reasoning_effort": "low"},
+            "openai/gpt-6-sol": {"reasoning_effort": "none"},
+            "openai/gpt-5-mini": {"reasoning_effort": "minimal"},
+            "openai/gpt-6-astra": {"reasoning_effort": "low"},
+            "gemini/gemini-2.5-flash": {"reasoning_effort": "disable"},
+            "gemini/gemini-2.5-pro": {"reasoning_effort": "minimal"},
+            "deepseek/deepseek-flash": {"reasoning_effort": "none"},
+            "together_ai/zai-org/GLM-5.2": {"reasoning_effort": "none"},
+            "mistral/mistral-small-2603": {"reasoning_effort": "none"},
+            "xai/grok-4.7": {"reasoning_effort": "low"},
+            "anthropic/claude-sonnet-5-5": {"thinking": {"type": "between_tools"}},
+            "bedrock/us.anthropic.claude-sonnet-5": {"thinking": {"type": "disabled"}},
+            "bedrock/us.anthropic.claude-opus-5-5": {"reasoning_effort": "low"},
+            "bedrock/us.openai.gpt-6-sol": {"reasoning_effort": "none"},
+            "groq/qwen/qwen3.8-27b": {"reasoning_effort": "none"},
+            "groq/openai/gpt-oss-120b": {"reasoning_effort": "low"},
+            "mistral/mistral-large-4-0": {"reasoning_effort": "low"},
+            "cohere/command-a-reasoning-08-2025": {
+                "extra_body": {"thinking": {"type": "disabled"}}
+            },
+            "cohere/command-a-03-2025": {},
+            "openai/gpt-4o-mini": {},
+        }
+        for model, sent in expected.items():
+            with self.subTest(model=model):
+                await LanguageModel(model=model)(messages, reasoning_effort="disable")
+                kwargs = mock_completion.call_args.kwargs
+                keys = ("thinking", "reasoning_effort", "extra_body")
+                got = {k: kwargs[k] for k in keys if k in kwargs}
+                self.assertEqual(got, sent)
+
+    @patch("litellm.acompletion")
     async def test_native_reasoning_fills_thinking_before_the_answer(
         self, mock_completion
     ):
@@ -1102,6 +1146,7 @@ class SupportedProvidersTest(testing.TestCase):
             "huggingface",
             "mirai",
             "mistral",
+            "nebius",
             "ollama",
             "openai",
             "openrouter",
@@ -1125,6 +1170,33 @@ class SupportedProvidersTest(testing.TestCase):
         providers = LanguageModel.supported_providers()
         providers.append("nope")
         self.assertNotIn("nope", LanguageModel.supported_providers())
+
+    def test_nebius_is_a_provider_with_its_key_and_endpoint(self):
+        info = LanguageModel.provider_info("nebius")
+        self.assertEqual(
+            [(v["name"], v["required"], v["secret"]) for v in info["env"]],
+            [("NEBIUS_API_KEY", True, True), ("NEBIUS_API_BASE", False, False)],
+        )
+        self.assertEqual(info["lists_models_from"], "catalog")
+
+    @patch("litellm.acompletion")
+    async def test_nebius_structured_output_sends_a_strict_json_schema(
+        self, mock_completion
+    ):
+        class Answer(DataModel):
+            answer: str
+
+        lm = LanguageModel(model="nebius/meta-llama/Llama-3.3-70B-Instruct")
+        mock_completion.return_value = {
+            "choices": [{"message": {"content": '{"answer": "B"}'}}]
+        }
+        result = await lm(_chat_messages(), schema=Answer.get_schema())
+        self.assertEqual(result.get_json(), {"answer": "B"})
+        called = mock_completion.call_args.kwargs
+        self.assertEqual(called["response_format"]["type"], "json_schema")
+        self.assertTrue(called["response_format"]["json_schema"]["strict"])
+        # Not routed through OpenRouter: no provider preferences are added.
+        self.assertNotIn("provider", called)
 
     @patch("litellm.acompletion")
     async def test_mirai_routes_to_local_hosted_vllm(self, mock_completion):
@@ -1861,6 +1933,24 @@ class ProviderMetadataTest(testing.TestCase):
         )
         self.assertNotIn("chat_template_kwargs", sent)
         self.assertEqual(result, {"thinking": "native trace", "answer": "Paris"})
+
+    async def test_openrouter_disable_turns_reasoning_off_for_a_reasoner(self):
+        server, base = self._serve(
+            models=[
+                {"id": "qwen/qwen3.8-27b", "supported_parameters": ["reasoning"]},
+                {"id": "openai/gpt-4o-mini", "supported_parameters": ["tools"]},
+            ],
+        )
+        api_base = f"{base}/api/v1"
+        thinking = LanguageModel(model="openrouter/qwen/qwen3.8-27b", api_base=api_base)
+        plain = LanguageModel(model="openrouter/openai/gpt-4o-mini", api_base=api_base)
+
+        await self._ask(thinking, effort="disable")
+        await self._ask(plain, effort="disable")
+
+        self.assertEqual(server.requests[0]["reasoning"], {"enabled": False})
+        self.assertNotIn("reasoning_effort", server.requests[0])
+        self.assertNotIn("reasoning", server.requests[1])
 
     async def test_openrouter_list_unreachable_keeps_thinking(self):
         server, base = self._serve()
