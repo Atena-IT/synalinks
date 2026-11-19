@@ -417,14 +417,15 @@ class OAuthLanguageModelTest(testing.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported language model"):
             OAuthLanguageModel.provider_info("openai")
 
-    async def test_input_modalities_come_from_the_catalog(self):
-        with patch(_RUN, Recorder()):
-            sol = OAuthLanguageModel(model="codex/gpt-6.1-sol")
-            self.assertTrue(await sol.supports_vision())
-            self.assertFalse(await sol.supports_audio())
-            # No `input_modalities`, or no entry at all: text only.
-            for model in ("codex/gpt-5.5", "codex/default", "codex/unknown"):
-                self.assertFalse(await OAuthLanguageModel(model=model).supports_vision())
+    async def test_capabilities_default_to_true(self):
+        lm = OAuthLanguageModel(model="codex/gpt-6.1-sol")
+        self.assertTrue(await lm.supports_reasoning())
+        self.assertTrue(await lm.supports_vision())
+        self.assertTrue(await lm.supports_audio())
+        off = OAuthLanguageModel(model="codex/gpt-5.5", supports_audio=False)
+        self.assertFalse(await off.supports_audio())
+        restored = OAuthLanguageModel.from_config(off.get_config())
+        self.assertFalse(await restored.supports_audio())
 
     async def test_supported_models_are_those_of_the_model_picker(self):
         catalog = {
@@ -1481,8 +1482,8 @@ class AppServerToolCallingTest(testing.TestCase):
             [
                 {"calls": [("add", {"a": 17, "b": 25})]},
                 {"calls": [("multiply", {"a": 42, "b": 3})]},
-                {"message": "(17 + 25) * 3 = 126."},
-                {"message": '{"result": 126}'},
+                # The structured answer is a call to the output tool.
+                {"calls": [("final_answer", {"result": 126})]},
             ]
         )
         lm = self._lm(fake)
@@ -1499,7 +1500,8 @@ class AppServerToolCallingTest(testing.TestCase):
         result = await program(Question(question="What is (17 + 25) * 3?"))
 
         self.assertEqual(result.get_json()["result"], 126)
-        self.assertEqual(fake.processes, 4)
+        # Three steps, the last answering: no separate final-answer turn.
+        self.assertEqual(fake.processes, 3)
         messages = result.get_json()["messages"]
         self.assertEqual(
             [(m["role"], m.get("tool_call_id")) for m in messages],
@@ -1508,17 +1510,21 @@ class AppServerToolCallingTest(testing.TestCase):
                 ("tool", "call_0"),
                 ("assistant", None),
                 ("tool", "call_1"),
+                ("assistant", None),
+                ("tool", "call_2"),
             ],
         )
         self.assertEqual(messages[1]["content"], {"result": 42})
         self.assertEqual(messages[3]["content"], {"result": 126})
-        # Each step sends the trajectory so far as native items, and the
-        # final answer is constrained by the schema over that same history.
+        # Each step sends the trajectory so far as native items.
         injected = fake.params("thread/inject_items")
-        self.assertEqual([len(p["items"]) for p in injected], [3, 5, 5])
+        self.assertEqual([len(p["items"]) for p in injected], [3, 5])
         self.assertEqual(injected[-1]["items"][-1]["type"], "function_call_output")
-        self.assertIn("outputSchema", fake.params("turn/start")[-1])
-        self.assertNotIn("dynamicTools", fake.params("thread/start")[-1])
+        # The output tool is declared with the others.
+        self.assertEqual(
+            [t["name"] for t in fake.params("thread/start")[-1]["dynamicTools"]],
+            ["add", "multiply", "final_answer"],
+        )
 
     async def test_failed_turn_is_retried_unless_the_request_was_rejected(self):
         fake = FakeAppServer([{"fail": "boom"}, {"message": "126"}])

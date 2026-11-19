@@ -51,7 +51,7 @@ dependencies = [
   # needs to mount the virtual filesystem it pivots into. Missing libfuse is
   # detected by `_confinement_available` (synalinks/src/sandboxes/_confinement.py)
   # and fails closed under `require_confinement`.
-  "mirage-ai[fuse]>=0.0.7",
+  "mirage-ai[fuse]>=0.0.8",
   "optree",
   "orjson",
   "pillow",
@@ -76,6 +76,12 @@ synalinks = "synalinks.cli.main:cli"
 [project.optional-dependencies]
 codex = [
     "openai-codex-cli-bin>=0.162.0",
+]
+# Relate by Neo4j as the graph store: KnowledgeBase(graph_uri="relate://...").
+# Relate has no graph algorithms: PageRank and communities come from networkx.
+relate = [
+    "relate-db>=1.0.2",
+    "networkx>=3.0",
 ]
 
 [build-system]
@@ -180,4 +186,7 @@ dev = [
     "zensical>=0.0.46",
     # Only to check the sandbox against E2B's own SDK (e2b_compatibility_test).
     "e2b-code-interpreter>=2.10.0",
+    # The optional Relate graph store, so its adapter tests always run.
+    "relate-db>=1.0.2",
+    "networkx>=3.0",
 ]

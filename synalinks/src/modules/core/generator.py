@@ -60,9 +60,10 @@ XML_TAGS_REGEX = re.compile(
 )
 
 
-# A prompt template can come from a saved program or a user's config, so it is rendered in Jinja's
-# sandbox: a plain environment lets a template reach Python (`cycler.__init__.__globals__.os`) and
-# run a command. The sandbox refuses underscored attributes and unsafe callables.
+# A prompt template can come from a saved program or a user's config, so it is
+# rendered in Jinja's sandbox: a plain environment lets a template reach Python
+# (`cycler.__init__.__globals__.os`) and run a command. The sandbox refuses
+# underscored attributes and unsafe callables.
 _PROMPT_JINJA = jinja2.sandbox.SandboxedEnvironment()
 
 
@@ -500,9 +501,7 @@ class Generator(Module):
             tool_schemas=tool_schemas,
             streaming=streaming,
             reasoning_effort=self.reasoning_effort,
-            # Only when asked: e.g. `"none"` keeps the tools declared (so the
-            # provider still parses the model's tool syntax) while forbidding
-            # a call.
+            # Only when asked (e.g. the agent's `"required"`, with its output tool).
             **({"tool_choice": tool_choice} if tool_choice is not None else {}),
             **sampling,
         )
