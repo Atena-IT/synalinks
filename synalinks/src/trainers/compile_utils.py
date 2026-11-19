@@ -43,6 +43,10 @@ class MetricsList(metrics_module.Metric):
     def get_result(self):
         return {m.name: m.result() for m in self.metrics}
 
+    async def close(self):
+        for metric in self.metrics:
+            await metric.close()
+
     def get_config(self):
         raise NotImplementedError
 
@@ -352,6 +356,16 @@ class CompileMetrics(metrics_module.Metric):
                     results[name] = m.result()
 
         return results
+
+    async def close(self):
+        """Close every metric compiled in, built or user-passed. Idempotent."""
+        seen = set()
+        # A program compiled but never run has built nothing yet.
+        built = getattr(self, "_flat_metrics", None) or []
+        for metric in [*built, *tree.flatten(self._user_metrics)]:
+            if isinstance(metric, metrics_module.Metric) and id(metric) not in seen:
+                seen.add(id(metric))
+                await metric.close()
 
     def get_config(self):
         raise NotImplementedError
@@ -779,6 +793,16 @@ class CompileReward(rewards_module.Reward):
             total_reward = sum(reward_values)
             return total_reward
         return None
+
+    async def close(self):
+        """Close every reward compiled in, resolved or user-passed. Idempotent."""
+        seen = set()
+        flat = [r.reward for r in getattr(self, "_flat_rewards", None) or []]
+        for reward in [*flat, *tree.flatten(self._user_reward)]:
+            reward = getattr(reward, "reward", reward)  # a weighted reward, unwrapped
+            if isinstance(reward, rewards_module.Reward) and id(reward) not in seen:
+                seen.add(id(reward))
+                await reward.close()
 
     def get_config(self):
         raise NotImplementedError
