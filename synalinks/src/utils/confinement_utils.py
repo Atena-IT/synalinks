@@ -605,6 +605,14 @@ maybe_warn_native_windows()
 
 confine_smoke_cache: Optional[Tuple[bool, str]] = None
 
+# The user-namespace probe's child exits ``90 + step`` at the step that failed.
+PROBE_STEPS = {
+    90: "unshare",
+    91: "writing /proc/self/setgroups",
+    92: "writing /proc/self/uid_map",
+    93: "writing /proc/self/gid_map",
+}
+
 # ``CLONE_NEW*`` flags for the user-namespace probe in
 # `confinement_available`. ``CONFINE_SRC`` carries its
 # own copy because it runs as source in a separate interpreter.
@@ -688,44 +696,52 @@ def confinement_available() -> tuple[bool, str]:
     # ``/proc/self/setgroups``), where every confined run would die with
     # ``confine-error``. Settle it by attempting the first steps of
     # ``_confine`` in a throwaway child (the fork keeps ``unshare`` off this
-    # process). Cached: the answer is constant for the process lifetime.
+    # process). Only a success is cached: a refusal can pass again by itself (a
+    # Kubernetes node refused the ``uid_map`` write for a while, then allowed
+    # it), and a cached one would refuse every sandbox until a restart, so the
+    # next sandbox probes again.
     global confine_smoke_cache
-    if confine_smoke_cache is None:
+    if confine_smoke_cache is not None:
+        return confine_smoke_cache
+    try:
+        pid = os.fork()
+    except OSError as exc:
+        return False, f"cannot fork to probe confinement: {exc}"
+    if pid == 0:  # child: bare-minimum work, never returns to the caller
+        step = 0
         try:
-            pid = os.fork()
-        except OSError as exc:
-            return False, f"cannot fork to probe confinement: {exc}"
-        if pid == 0:  # child: bare-minimum work, never returns to the caller
-            try:
-                uid, gid = os.getuid(), os.getgid()
-                os.unshare(
-                    CLONE_NEWUSER
-                    | CLONE_NEWNS
-                    | CLONE_NEWNET
-                    | CLONE_NEWIPC
-                    | CLONE_NEWUTS
-                    | CLONE_NEWPID
-                )
-                with open("/proc/self/setgroups", "w") as fh:
-                    fh.write("deny")
-                with open("/proc/self/uid_map", "w") as fh:
-                    fh.write("0 %d 1" % uid)
-                with open("/proc/self/gid_map", "w") as fh:
-                    fh.write("0 %d 1" % gid)
-            except BaseException:
-                os._exit(99)
-            os._exit(0)
-        _, status = os.waitpid(pid, 0)
-        if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
-            confine_smoke_cache = (True, "")
-        else:
-            confine_smoke_cache = (
-                False,
-                "the kernel/environment forbids unprivileged user-namespace setup "
-                "(e.g. writing /proc/self/setgroups is denied, as on GitHub "
-                "Actions and inside many containers)",
+            uid, gid = os.getuid(), os.getgid()
+            os.unshare(
+                CLONE_NEWUSER
+                | CLONE_NEWNS
+                | CLONE_NEWNET
+                | CLONE_NEWIPC
+                | CLONE_NEWUTS
+                | CLONE_NEWPID
             )
-    return confine_smoke_cache
+            for step, (path, data) in enumerate(
+                (
+                    ("/proc/self/setgroups", "deny"),
+                    ("/proc/self/uid_map", "0 %d 1" % uid),
+                    ("/proc/self/gid_map", "0 %d 1" % gid),
+                ),
+                start=1,
+            ):
+                with open(path, "w") as fh:
+                    fh.write(data)
+        except BaseException:
+            os._exit(90 + step)
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+        confine_smoke_cache = (True, "")
+        return confine_smoke_cache
+    code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else None
+    refused = PROBE_STEPS.get(code, "the probe child")
+    return False, (
+        f"the kernel/environment forbids unprivileged user-namespace setup "
+        f"({refused} was refused, as on GitHub Actions and inside many containers)"
+    )
 
 
 def confinement_backend() -> Tuple[Optional[str], str]:
