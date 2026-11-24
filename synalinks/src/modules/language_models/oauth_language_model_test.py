@@ -616,6 +616,21 @@ class OAuthLanguageModelTest(testing.TestCase):
                 await lm(_messages(), schema=FreeForm.get_schema())
         self.assertEqual(recorder.calls, [])
 
+    async def test_build_request_asks_for_the_strict_schema_a_call_sends(self):
+        lm = OAuthLanguageModel(model="codex/gpt-6.1-sol")
+        built = await lm.build_request(_messages(), schema=Person.get_schema())
+        self.assertEqual(
+            built["response_format"]["json_schema"]["schema"],
+            _strict_schema(Person.get_schema()),
+        )
+
+    async def test_build_request_refuses_what_a_call_refuses(self):
+        lm = OAuthLanguageModel(model="codex/gpt-6.1-sol")
+        with self.assertRaisesRegex(ValueError, "free-form object"):
+            await lm.build_request(_messages(), schema=FreeForm.get_schema())
+        with self.assertRaisesRegex(ValueError, "streaming"):
+            await lm.build_request(_messages(), streaming=True)
+
     async def test_tool_use_fails_the_call_without_retry(self):
         stdout = _events(
             "I searched the web.",

@@ -148,9 +148,6 @@ _CACHE_CREATION_TTL_KEYS = (
 )
 
 
-# Usage of the LM call running in the current task, read by hooks (the MLflow
-# `Monitor` hook writes it as span attributes). A ContextVar rather than an
-# instance attribute so concurrent calls on one LM never see each other's.
 class _PreparedRequest(NamedTuple):
     """What `LanguageModel._prepare_request` builds for one call."""
 
@@ -161,6 +158,9 @@ class _PreparedRequest(NamedTuple):
     kwargs: dict
 
 
+# Usage of the LM call running in the current task, read by hooks (the MLflow
+# `Monitor` hook writes it as span attributes). A ContextVar rather than an
+# instance attribute so concurrent calls on one LM never see each other's.
 _CURRENT_CALL_USAGE = contextvars.ContextVar("synalinks_lm_call_usage", default=None)
 
 
@@ -948,19 +948,16 @@ class LanguageModel(Module):
         """
         if not messages:
             return None
-        if schema and (tools or tool_schemas):
-            raise ValueError(
-                "`schema` and `tools` cannot be passed to the same LM call: "
-                "schema forces structured output, while tools let the LM choose "
-                "which to call. Declare the structured answer as one more tool "
-                "(as the function-calling agent's `final_answer`), or split into "
-                "two calls."
-            )
+        self._check_call(schema, tools, tool_schemas, streaming)
         # Cleared per call: a cache hit or a streamed call has no choice to
         # read it from and must not report the previous call's reason.
         self.last_call_finish_reason = None
         _CURRENT_CALL_USAGE.set(None)
         input_kwargs = copy.deepcopy(kwargs)
+        # The fallback is another model: it gets the caller's schema, not the
+        # one rewritten for this model (`thinking` left out, a `$ref`'s
+        # description dropped).
+        input_schema = schema
         prepared = await self._prepare_request(
             messages,
             schema,
@@ -1026,7 +1023,7 @@ class LanguageModel(Module):
                 self._record_event("fallback_activations")
                 response = await self.fallback(
                     messages,
-                    schema=schema,
+                    schema=input_schema,
                     tools=tools,
                     tool_schemas=tool_schemas,
                     streaming=streaming,
@@ -1059,7 +1056,7 @@ class LanguageModel(Module):
         """
         # Merge instance-level defaults; per-call kwargs win.
         kwargs = {**self.default_kwargs, **kwargs}
-        schema = copy.deepcopy(schema)
+        schema = self._wire_schema(schema)
         provider = self.model.split("/")[0]
 
         # Single pass: messages → OpenAI wire shape (nested tool_call
@@ -1373,7 +1370,7 @@ class LanguageModel(Module):
             kwargs.update({"stream": True})
         # Enable prompt caching for the system instructions
         # (that only change during training not inference)
-        if provider in ("gemini", "anthropic"):
+        if provider in ("gemini", "anthropic") and formatted_messages:
             system_message_with_cache_control = {
                 **formatted_messages[0],
                 "cache_control": {"type": "ephemeral"},
@@ -1384,7 +1381,13 @@ class LanguageModel(Module):
         )
 
     async def build_request(
-        self, messages, schema=None, tools=None, tool_schemas=None, **kwargs
+        self,
+        messages,
+        schema=None,
+        tools=None,
+        tool_schemas=None,
+        streaming=False,
+        **kwargs,
     ):
         """What a call with these arguments would send, without sending it.
 
@@ -1394,8 +1397,9 @@ class LanguageModel(Module):
         structured-output payload, the tools, the reasoning level, the
         provider routing). Transport settings (`timeout`, `caching`) are left
         out. Nothing is sent and the file cache is not read; deferred media
-        references (a URL or a path) are left as given, not fetched. A
-        request is never streamed here.
+        references (a URL or a path) are left as given, not fetched. The
+        request is a copy: changing it changes neither the model's defaults
+        nor the arguments given.
 
         ```python
         import synalinks
@@ -1413,31 +1417,60 @@ class LanguageModel(Module):
                 (optional). Mutually exclusive with `schema`.
             tool_schemas (list): Tool declarations already in wire shape
                 (optional). Mutually exclusive with `schema`.
+            streaming (bool): Whether the call would stream (optional): it
+                sets `stream`, as in `call()`, unless a schema is given.
             **kwargs (keyword arguments): The call's own keyword arguments.
 
         Returns:
-            (dict): `model`, `messages` and the request parameters.
+            (dict): `model`, `messages` and the request parameters, or None
+                when there are no messages (a call sends nothing then).
+
+        Raises:
+            ValueError: Whatever `call()` refuses before sending (a schema
+                with tools, or what the model itself cannot take).
         """
-        if schema and (tools or tool_schemas):
-            raise ValueError(
-                "`schema` and `tools` cannot be passed to the same LM call: "
-                "schema forces structured output, while tools let the LM choose "
-                "which to call."
-            )
+        if not messages:
+            return None
+        self._check_call(schema, tools, tool_schemas, streaming)
         prepared = await self._prepare_request(
             messages,
             schema,
             tools,
             tool_schemas,
-            False,
+            streaming,
             kwargs,
             resolve_media=False,
         )
-        return {
-            "model": self.model,
-            "messages": prepared.messages,
-            **prepared.kwargs,
-        }
+        return copy.deepcopy(
+            {
+                "model": self.model,
+                "messages": prepared.messages,
+                **prepared.kwargs,
+            }
+        )
+
+    def _check_call(self, schema, tools, tool_schemas, streaming):
+        """Refuse a call this model cannot make, before anything is built.
+
+        Raises:
+            ValueError: If `schema` comes with `tools` or `tool_schemas`.
+        """
+        if schema and (tools or tool_schemas):
+            raise ValueError(
+                "`schema` and `tools` cannot be passed to the same LM call: "
+                "schema forces structured output, while tools let the LM choose "
+                "which to call. Declare the structured answer as one more tool "
+                "(as the function-calling agent's `final_answer`), or split into "
+                "two calls."
+            )
+
+    def _wire_schema(self, schema):
+        """The schema this model is asked for: a copy of the caller's.
+
+        A subclass whose backend takes a stricter shape rewrites it here, so
+        `call()` and `build_request()` both send the rewritten one.
+        """
+        return copy.deepcopy(schema)
 
     async def _acompletion(self, formatted_messages, **kwargs):
         """Send one completion request and return the provider response.

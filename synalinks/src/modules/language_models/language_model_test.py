@@ -2155,3 +2155,66 @@ class BuildRequestTest(testing.TestCase):
         built = await lm.build_request(_question())
         self.assertEqual(built["model"], "codex/gpt-6.1-sol")
         self.assertEqual(built["messages"][0]["content"], "Pick one.")
+
+    async def test_build_request_returns_a_request_of_its_own(self):
+        lm = LanguageModel(model="openrouter/acme/plain-1", provider={"order": ["acme"]})
+        tool = copy.deepcopy(_LOOKUP_TOOL)
+        built = await lm.build_request(_question(), tool_schemas=[tool])
+        built["provider"]["ignore"] = ["nebius"]
+        built["tools"][0]["function"]["name"] = "changed"
+        self.assertEqual(lm.default_kwargs["provider"], {"order": ["acme"]})
+        self.assertEqual(tool, _LOOKUP_TOOL)
+
+    async def test_build_request_has_nothing_to_send_without_messages(self):
+        lm = LanguageModel(model="openrouter/acme/plain-1")
+        self.assertIsNone(await lm.build_request(None))
+
+    async def test_build_request_of_an_empty_conversation_sends_no_message(self):
+        lm = LanguageModel(model="anthropic/claude-x")
+        built = await lm.build_request(ChatMessages(messages=[]))
+        self.assertEqual(built["messages"], [])
+
+    @patch("litellm.acompletion")
+    async def test_build_request_streams_as_a_call_does(self, mock_completion):
+        mock_completion.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        lm = LanguageModel(model="openai/gpt-4o-mini")
+        built = await lm.build_request(_question(), streaming=True)
+        await lm(_question(), streaming=True)
+        self.assertEqual(built, _sent(mock_completion))
+        self.assertTrue(built["stream"])
+        self.assertNotIn("streaming", built)
+        structured = await lm.build_request(
+            _question(), schema=_BuiltAnswer.get_schema(), streaming=True
+        )
+        self.assertNotIn("stream", structured)
+
+
+class _ThoughtAnswer(DataModel):
+    thinking: str
+    answer: str
+
+
+class FallbackSchemaTest(testing.TestCase):
+    @patch("litellm.acompletion")
+    async def test_fallback_receives_the_callers_schema(self, mock_completion):
+        mock_completion.side_effect = [
+            Exception("primary down"),
+            {"choices": [{"message": {"content": '{"thinking": "t", "answer": "B"}'}}]},
+        ]
+        lm = LanguageModel(
+            model="openrouter/acme/thinker-1",
+            supports_reasoning=True,
+            retry=1,
+            retry_max_wait=0,
+            fallback=LanguageModel(model="openai/gpt-4o-mini"),
+        )
+        schema = _ThoughtAnswer.get_schema()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            await lm(_question(), schema=schema, reasoning_effort="high")
+        primary, fallback = (c.kwargs for c in mock_completion.call_args_list)
+        primary_schema = primary["response_format"]["json_schema"]["schema"]
+        fallback_schema = fallback["response_format"]["json_schema"]["schema"]
+        self.assertNotIn("thinking", primary_schema["properties"])
+        self.assertIn("thinking", fallback_schema["properties"])
+        self.assertIn("thinking", fallback_schema["required"])
