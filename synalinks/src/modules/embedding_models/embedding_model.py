@@ -52,27 +52,6 @@ _EM_PROMPT_DETAIL_KEYS = (
 )
 
 
-def _extract_em_extras(usage, response):
-    """Pull tier-1 counters + long-tail details from a LiteLLM EmbeddingResponse.
-
-    Returns ``(cached_tokens, extras)``.
-    """
-    prompt_details = _safe_get(usage, "prompt_tokens_details")
-    hidden = getattr(response, "_hidden_params", None) or {}
-    cached = _to_int(_safe_get(prompt_details, "cached_tokens"))
-    extras = {}
-    for key in _EM_PROMPT_DETAIL_KEYS:
-        v = _safe_get(prompt_details, key)
-        if v:
-            extras[f"prompt_{key}"] = v
-    overhead = (
-        hidden.get("litellm_overhead_time_ms") if isinstance(hidden, dict) else None
-    )
-    if overhead is not None:
-        extras["litellm_overhead_time_ms"] = overhead
-    return cached, extras
-
-
 def _accumulate(obj, phase_prefix, increments, extras):
     for suffix, delta in increments.items():
         attr = f"{phase_prefix}cumulated_{suffix}"
@@ -181,7 +160,8 @@ class EmbeddingModel(Module):
     Args:
         model (str): The model to use.
         api_base (str): Optional. The endpoint to use.
-        retry (int): Optional. The number of retry.
+        retry (int): Optional. The maximum number of attempts, the first
+            one included.
         retry_max_wait (int): Optional. Max seconds to wait between retries when a
             rate-limit `Retry-After` header is honored (default to 60).
         fallback (EmbeddingModel): Optional. The embedding model to fallback
@@ -198,7 +178,9 @@ class EmbeddingModel(Module):
         hooks (list): Optional. Hooks to attach to this module's calls.
         **default_kwargs: Optional. Default parameters (e.g. `dimensions`,
             `encoding_format`) forwarded to every call. Per-call kwargs
-            override these.
+            override these. Credentials (`api_key`, `*_token`, `*_secret_*`,
+            `extra_headers`...) are never serialized by `get_config`: set them
+            again on load, or use environment variables.
     """
 
     def __init__(
@@ -398,7 +380,21 @@ class EmbeddingModel(Module):
                 usage = response.get("usage") or {}
                 prompt_tokens = int(usage.get("prompt_tokens") or 0)
                 total_tokens = int(usage.get("total_tokens") or prompt_tokens)
-                cached, extras = _extract_em_extras(usage, response)
+                prompt_details = _safe_get(usage, "prompt_tokens_details")
+                hidden = getattr(response, "_hidden_params", None) or {}
+                cached = _to_int(_safe_get(prompt_details, "cached_tokens"))
+                extras = {}
+                for key in _EM_PROMPT_DETAIL_KEYS:
+                    v = _safe_get(prompt_details, key)
+                    if v:
+                        extras[f"prompt_{key}"] = v
+                overhead = (
+                    hidden.get("litellm_overhead_time_ms")
+                    if isinstance(hidden, dict)
+                    else None
+                )
+                if overhead is not None:
+                    extras["litellm_overhead_time_ms"] = overhead
                 self.last_call_prompt_tokens = prompt_tokens
                 self.last_call_tokens = total_tokens
                 self.last_call_vectors = n_vectors
@@ -541,9 +537,6 @@ class EmbeddingModel(Module):
         """
         return model_catalog.model_info(model)
 
-    def _obj_type(self):
-        return "EmbeddingModel"
-
     def get_config(self):
         config = {
             "model": self.model,
@@ -554,7 +547,11 @@ class EmbeddingModel(Module):
             "cache_dir": self.cache_dir,
             "name": self.name,
             "description": self.description,
-            **self.default_kwargs,
+            **{
+                k: v
+                for k, v in self.default_kwargs.items()
+                if not model_catalog.is_secret_kwarg(k)
+            },
         }
         if self.fallback:
             fallback_config = {

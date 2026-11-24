@@ -38,7 +38,7 @@ target). There are three ways to produce them; pick one and uncomment it.
 # A `Dataset` streams raw rows, renders each through a Jinja2 *template* into
 # JSON, and validates it against a `DataModel`. The classes share one contract:
 # `CSVDataset`, `JSONDataset`, `JSONLDataset`, `ParquetDataset`,
-# `HuggingFaceDataset`, `DuckDBDataset`, `LanceDBDataset`, `MarkdownDataset`.
+# `HuggingFaceDataset`, `MarkdownDataset`.
 #
 #   import synalinks
 #
@@ -64,7 +64,8 @@ target). There are three ways to produce them; pick one and uncomment it.
 #       return synalinks.datasets.split_train_test(x, y, validation_split=0.2)
 #
 # For RL-style streaming (batched, repeated rollouts) pass the dataset object
-# straight to fit: keep `batch_size=...`/`repeat=...` and call `program.fit(x=ds)`.
+# straight to fit: keep `batch_size=...`/`repeat=...` and call
+# `await program.fit(x=ds, validation_data=val_ds.materialize())`.
 
 
 # =============================================================================

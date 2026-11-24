@@ -51,49 +51,35 @@ class CallbackList(Callback):
         self._async_test = False
         self._async_predict = False
         self._futures = []
-        self._configure_async_dispatch(callbacks)
-        self._add_default_callbacks(add_history, add_progbar)
-        self.set_program(program)
-        self.set_params(params)
-
-    def set_params(self, params):
-        self.params = params
-        if params:
-            for callback in self.callbacks:
-                callback.set_params(params)
-
-    def _configure_async_dispatch(self, callbacks):
         # Determine whether callbacks can be dispatched asynchronously.
-        if not backend.IS_THREAD_SAFE:
-            return
-        async_train = True
-        async_test = True
-        async_predict = True
-        if callbacks:
-            if isinstance(callbacks, (list, tuple)):
-                for cbk in callbacks:
-                    if getattr(cbk, "async_safe", False):
-                        # Callbacks that expose self.async_safe == True
-                        # will be assumed safe for async dispatch.
-                        continue
-                    if not utils.is_default(cbk.on_batch_end):
-                        async_train = False
-                    if not utils.is_default(cbk.on_train_batch_end):
-                        async_train = False
-                    if not utils.is_default(cbk.on_test_batch_end):
-                        async_test = False
-                    if not utils.is_default(cbk.on_predict_batch_end):
-                        async_predict = False
+        if backend.IS_THREAD_SAFE:
+            async_train = True
+            async_test = True
+            async_predict = True
+            if callbacks:
+                if isinstance(callbacks, (list, tuple)):
+                    for cbk in callbacks:
+                        if getattr(cbk, "async_safe", False):
+                            # Callbacks that expose self.async_safe == True
+                            # will be assumed safe for async dispatch.
+                            continue
+                        if not utils.is_default(cbk.on_batch_end):
+                            async_train = False
+                        if not utils.is_default(cbk.on_train_batch_end):
+                            async_train = False
+                        if not utils.is_default(cbk.on_test_batch_end):
+                            async_test = False
+                        if not utils.is_default(cbk.on_predict_batch_end):
+                            async_predict = False
 
-        if async_train or async_test or async_predict:
-            self._executor = concurrent.futures.ThreadPoolExecutor()
+            if async_train or async_test or async_predict:
+                self._executor = concurrent.futures.ThreadPoolExecutor()
 
-        self._async_train = async_train
-        self._async_test = async_test
-        self._async_predict = async_predict
+            self._async_train = async_train
+            self._async_test = async_test
+            self._async_predict = async_predict
 
-    def _add_default_callbacks(self, add_history, add_progbar):
-        """Adds `Callback`s that are always present."""
+        # Callbacks that are always present.
         self._progbar = None
         self._history = None
         self._monitor = None
@@ -117,6 +103,15 @@ class CallbackList(Callback):
         if self._monitor is None and is_observability_enabled():
             self._monitor = Monitor()
             self.callbacks.append(self._monitor)
+
+        self.set_program(program)
+        self.set_params(params)
+
+    def set_params(self, params):
+        self.params = params
+        if params:
+            for callback in self.callbacks:
+                callback.set_params(params)
 
     def set_program(self, program):
         if not program:
@@ -230,6 +225,12 @@ class CallbackList(Callback):
         for callback in self.callbacks:
             callback.on_train_end(logs)
 
+    def on_train_error(self, error):
+        if self._async_train:
+            self._clear_futures()
+        for callback in self.callbacks:
+            callback.on_train_error(error)
+
     def on_test_begin(self, logs=None):
         logs = python_utils.pythonify_logs(logs)
         for callback in self.callbacks:
@@ -243,6 +244,12 @@ class CallbackList(Callback):
         for callback in self.callbacks:
             callback.on_test_end(logs)
 
+    def on_test_error(self, error):
+        if self._async_test:
+            self._clear_futures()
+        for callback in self.callbacks:
+            callback.on_test_error(error)
+
     def on_predict_begin(self, logs=None):
         logs = python_utils.pythonify_logs(logs)
         for callback in self.callbacks:
@@ -255,3 +262,9 @@ class CallbackList(Callback):
         logs = python_utils.pythonify_logs(logs)
         for callback in self.callbacks:
             callback.on_predict_end(logs)
+
+    def on_predict_error(self, error):
+        if self._async_predict:
+            self._clear_futures()
+        for callback in self.callbacks:
+            callback.on_predict_error(error)

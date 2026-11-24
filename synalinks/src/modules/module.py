@@ -125,7 +125,7 @@ class Module(BackendModule, Operation, SynalinksSaveable):
     """
 
     def __new__(cls, *args, **kwargs):
-        obj = super().__new__(cls)  # , *args, **kwargs)
+        obj = super().__new__(cls, *args, **kwargs)
 
         # Wrap the user-provided `build` method in the `build_wrapper`
         # to add name scope support and serialization support.
@@ -355,9 +355,6 @@ class Module(BackendModule, Operation, SynalinksSaveable):
                     symbolic_inputs[key] = backend.SymbolicDataModel(schema=schema)
                 run_maybe_nested(self.build(**symbolic_inputs))
             self.built = True
-
-    def _obj_type(self):
-        return "Module"
 
     @property
     def metrics(self):

@@ -11,14 +11,17 @@ from synalinks.src.version import __version__
 
 
 class _FakeRunInfo:
-    def __init__(self, run_id="run-123", artifact_uri=""):
+    def __init__(self, run_id="run-123", artifact_uri="", run_name=None):
         self.run_id = run_id
         self.artifact_uri = artifact_uri
+        self.run_name = run_name
 
 
 class _FakeRun:
-    def __init__(self, run_id="run-123", artifact_uri=""):
-        self.info = _FakeRunInfo(run_id=run_id, artifact_uri=artifact_uri)
+    def __init__(self, run_id="run-123", artifact_uri="", run_name=None):
+        self.info = _FakeRunInfo(
+            run_id=run_id, artifact_uri=artifact_uri, run_name=run_name
+        )
 
 
 class _FakeProgram:
@@ -38,11 +41,6 @@ def _run_coro(coro):
 
 
 class MonitorInitTest(testing.TestCase):
-    def test_missing_mlflow_raises(self):
-        with patch.object(monitor_module, "MLFLOW_AVAILABLE", False):
-            with self.assertRaisesRegex(ImportError, "mlflow is required"):
-                Monitor()
-
     def test_default_attributes(self):
         cb = Monitor()
         self.assertIsNone(cb.experiment_name)
@@ -333,7 +331,10 @@ class MonitorResumeTest(testing.TestCase):
             lookup.return_value.experiment_id = "exp-1"
             cb._setup_mlflow()
             client = mlf.MlflowClient.return_value
-            client.search_runs.return_value = [_FakeRun(run_id="found-1")]
+            client.search_runs.return_value = [
+                _FakeRun(run_id="other", run_name="nightlyXtest"),
+                _FakeRun(run_id="found-1", run_name="nightly_test"),
+            ]
             client.get_run.return_value.data.metrics = {}
             mlf.start_run.return_value = _FakeRun(run_id="found-1")
             cb._start_run(run_name_suffix="test")
@@ -342,6 +343,25 @@ class MonitorResumeTest(testing.TestCase):
         self.assertIn("'nightly_test'", search_kwargs["filter_string"])
         mlf.start_run.assert_called_once_with(run_id="found-1")
         self.assertEqual(cb.run_id, "found-1")
+
+    def test_resume_run_name_with_quotes(self):
+        name = 'nightly\'s "eval"'
+        cb = Monitor(run_name=name, resume=True)
+        cb.set_program(_FakeProgram())
+        with patch.object(monitor_module, "mlflow") as mlf:
+            cb._setup_mlflow()
+            client = mlf.MlflowClient.return_value
+            client.search_runs.return_value = [
+                _FakeRun(run_id="found-1", run_name=name + "_test")
+            ]
+            client.get_run.return_value.data.metrics = {}
+            mlf.start_run.return_value = _FakeRun(run_id="found-1")
+            cb._start_run(run_name_suffix="test")
+        filter_string = client.search_runs.call_args.kwargs["filter_string"]
+        self.assertEqual(
+            filter_string, "tags.mlflow.runName LIKE 'nightly_s _eval__test'"
+        )
+        mlf.start_run.assert_called_once_with(run_id="found-1")
 
     def test_resume_creates_run_when_none_found(self):
         cb = Monitor(run_name="nightly", resume=True)
@@ -369,7 +389,9 @@ class MonitorResumeTest(testing.TestCase):
             cb.on_test_begin()
             cb.on_test_end(logs={"reward": 0.3})
             # second evaluate() in the same process resumes the run found by name
-            client.search_runs.return_value = [_FakeRun(run_id="r1")]
+            client.search_runs.return_value = [
+                _FakeRun(run_id="r1", run_name="nightly_test")
+            ]
             client.get_metric_history.return_value = [_FakeMetric(0)]
             client.get_run.return_value.data.metrics = {"reward": 0.3}
             cb.on_test_begin()
@@ -586,7 +608,7 @@ class _FakeCompileMetrics:
 
 
 class MonitorParamsAndDatasetTest(testing.TestCase):
-    def test_collect_params_covers_compile_program_and_models(self):
+    async def test_collect_params_covers_compile_program_and_models(self):
         program = _FakeMonitoredProgram([_lm("judge")], name="qa")
         program.reward = _FakeReward()
         program.optimizer = _FakeOptimizer()
@@ -594,7 +616,10 @@ class MonitorParamsAndDatasetTest(testing.TestCase):
         cb = Monitor()
         cb.set_program(program)
         cb.set_params({"epochs": 3, "batch_size": 2, "steps": None})
-        params = cb._collect_params()
+        cb._run = _FakeRun()
+        with patch.object(monitor_module, "mlflow") as mlf:
+            await cb._log_params()
+        params = mlf.log_params.call_args[0][0]
         self.assertEqual(params["epochs"], 3)
         self.assertNotIn("steps", params)
         self.assertEqual(params["program_name"], "qa")
@@ -607,13 +632,16 @@ class MonitorParamsAndDatasetTest(testing.TestCase):
         self.assertEqual(params["lm.judge.temperature"], 0.2)
         self.assertIn("lm.judge.api_base", params)
 
-    def test_collect_params_truncates_long_values(self):
+    async def test_collect_params_truncates_long_values(self):
         program = _FakeProgram()
         program.reward = _FakeReward()
         program.reward.get_config = lambda: {"blob": "x" * 10000}
         cb = Monitor()
         cb.set_program(program)
-        params = cb._collect_params()
+        cb._run = _FakeRun()
+        with patch.object(monitor_module, "mlflow") as mlf:
+            await cb._log_params()
+        params = mlf.log_params.call_args[0][0]
         self.assertEqual(len(params["reward_config"]), 6000)
 
     def test_train_begin_logs_train_and_validation_datasets(self):
@@ -877,15 +905,22 @@ class PyfuncModelTest(testing.TestCase):
         self.assertEqual(signature.inputs.inputs[0].name, "question")
         self.assertIsNone(monitor_module.build_signature(None, None))
 
-    def test_to_records_accepts_dict_list_and_dataframe(self):
+    async def test_predict_accepts_dict_list_and_dataframe(self):
         import pandas as pd
 
-        self.assertEqual(monitor_module._to_records({"a": 1}), [{"a": 1}])
-        self.assertEqual(
-            monitor_module._to_records([{"a": 1}, {"a": 2}]), [{"a": 1}, {"a": 2}]
-        )
+        class _Echo:
+            input_schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
+
+            async def predict(self, x, verbose=0):
+                return list(x)
+
+        model = SynalinksProgramModel()
+        model.program = _Echo()
+        model._loop = monitor_module._BackgroundLoop()
+        self.assertEqual(model.predict(None, {"a": 1}), [{"a": 1}])
+        self.assertEqual(model.predict(None, [{"a": 1}, {"a": 2}]), [{"a": 1}, {"a": 2}])
         df = pd.DataFrame({"a": [1, 2]})
-        self.assertEqual(monitor_module._to_records(df), [{"a": 1}, {"a": 2}])
+        self.assertEqual(model.predict(None, df), [{"a": 1}, {"a": 2}])
 
     async def test_predict_runs_program_from_inside_a_running_loop(self):
         class _Prog:
@@ -1017,7 +1052,7 @@ class MonitorPromptRegistryTest(testing.TestCase):
             existing.name = "qa_prog.generator"
             existing.version = 7
             existing.uri = "prompts:/qa_prog.generator/7"
-            existing.template = monitor_module._render_prompt_messages(module)
+            existing.template = cb._snapshot_prompts()["qa_prog.generator"][1]
             mlf.MlflowClient.return_value.load_prompt.return_value = existing
             cb.on_train_begin()
             cb.on_epoch_end(0, logs={"reward": 0.4, "val_reward": 0.5})
@@ -1058,11 +1093,15 @@ class MonitorPromptRegistryTest(testing.TestCase):
 
     def test_inputs_schema_module_without_build_schema_is_skipped(self):
         module = _FakeGenerator("generator", "Answer.", use_inputs_schema=True)
-        self.assertIsNone(monitor_module._render_prompt_messages(module))
+        cb, _ = self._monitor(module)
+        self.assertEqual(cb._snapshot_prompts(), {})
         module._build_schemas_dict = {"inputs": {"type": "object", "properties": {}}}
-        messages = monitor_module._render_prompt_messages(module)
+        messages = cb._snapshot_prompts()["qa_prog.generator"][1]
         self.assertEqual(messages[0]["role"], "system")
 
     def test_prompt_name_sanitized(self):
-        self.assertEqual(monitor_module._prompt_name("my prog", "gen/1"), "my_prog.gen_1")
-        self.assertEqual(monitor_module._prompt_name(None, "gen"), "program.gen")
+        cb, program = self._monitor(_FakeGenerator("gen/1", "Answer."))
+        program.name = "my prog"
+        self.assertEqual(list(cb._snapshot_prompts()), ["my_prog.gen_1"])
+        program.name = None
+        self.assertEqual(list(cb._snapshot_prompts()), ["program.gen_1"])

@@ -37,39 +37,6 @@ def _size(x):
         return None
 
 
-def _clone_metric(metric):
-    """Return a fresh instance of `metric` with independent state.
-
-    Reconstructs the metric from its own config so a brand-new backend
-    ``Variable`` set (and, for operational metrics, an unbound model list) is
-    created -- true per-program isolation, not a shared-state view. Config
-    values that reference objects (e.g. a wrapped callable in
-    ``MeanMetricWrapper``) are carried over BY REFERENCE, never deep-copied, so
-    a metric wrapping a reward that holds a `LanguageModel` doesn't duplicate
-    that model.
-
-    Most metrics round-trip cleanly through ``from_config(get_config())``. The
-    one gap is a metric wrapping a *bare* callable the serialization registry
-    can't locate (e.g. a user's plain function passed to
-    ``MeanMetricWrapper``); that case is rebuilt directly, preserving the
-    callable by reference.
-    """
-    try:
-        return type(metric).from_config(metric.get_config())
-    except Exception:
-        if isinstance(metric, metrics_module.MeanMetricWrapper):
-            return type(metric)(
-                fn=metric._fn,
-                name=metric.name,
-                in_mask=metric.in_mask,
-                out_mask=metric.out_mask,
-                in_mask_pattern=metric.in_mask_pattern,
-                out_mask_pattern=metric.out_mask_pattern,
-                **metric._fn_kwargs,
-            )
-        raise
-
-
 def _own_metrics(metrics):
     """Return `metrics` with every metric instance replaced by a fresh clone.
 
@@ -96,20 +63,26 @@ def _own_metrics(metrics):
         return None
 
     def clone(m):
-        if isinstance(m, metrics_module.Metric):
-            return _clone_metric(m)
-        return m
+        if not isinstance(m, metrics_module.Metric):
+            return m
+        # Rebuild from config; config objects (a wrapped reward...) stay by reference.
+        try:
+            return type(m).from_config(m.get_config())
+        except Exception:
+            # A bare callable the registry cannot locate: rebuild it directly.
+            if isinstance(m, metrics_module.MeanMetricWrapper):
+                return type(m)(
+                    fn=m._fn,
+                    name=m.name,
+                    in_mask=m.in_mask,
+                    out_mask=m.out_mask,
+                    in_mask_pattern=m.in_mask_pattern,
+                    out_mask_pattern=m.out_mask_pattern,
+                    **m._fn_kwargs,
+                )
+            raise
 
     return tree.map_structure(clone, metrics)
-
-
-def _target_key(target):
-    """A hashable key identifying a target's value, for stratification."""
-    value = target.get_json() if hasattr(target, "get_json") else target
-    try:
-        return json.dumps(value, sort_keys=True, default=str)
-    except TypeError:
-        return repr(value)
 
 
 def stratified_minibatch_indices(y, size, rng=None):
@@ -137,7 +110,12 @@ def stratified_minibatch_indices(y, size, rng=None):
         return np.array([], dtype=int)
     groups = {}
     for index in range(n):
-        groups.setdefault(_target_key(y[index]), []).append(index)
+        value = y[index].get_json() if hasattr(y[index], "get_json") else y[index]
+        try:
+            key = json.dumps(value, sort_keys=True, default=str)
+        except TypeError:
+            key = repr(value)
+        groups.setdefault(key, []).append(index)
     if len(groups) <= 1 or len(groups) == n:
         return rng.choice(n, size=size, replace=False)
     buckets = [list(rng.permutation(members)) for members in groups.values()]
@@ -243,7 +221,25 @@ class Trainer:
                 will only be called every `N` batches (i.e. before/after
                 each compiled function execution).
         """
-        self._clear_previous_trainer_metrics()
+        # A submodule Trainer's metrics are not usable under a new Trainer: clear them.
+        for module in self._flatten_modules(include_self=False):
+            if not isinstance(module, Trainer):
+                continue
+            own_metrics = []
+            if self._reward_tracker is not None:
+                own_metrics.append(self._reward_tracker)
+            if self._compile_metrics is not None:
+                own_metrics.append(self._compile_metrics)
+            if self._compile_reward is not None:
+                own_metrics.extend(self._compile_reward.metrics)
+            own_metrics.extend(self._metrics)
+            for m in own_metrics:
+                module._tracker.untrack(m)
+            module._reward_tracker = None
+            module._compile_metrics = None
+            if module._compile_reward is not None:
+                module._compile_reward._metrics.clear()
+            module._metrics.clear()
         # Resolve string/dict identifiers (Keras-style) into instances.
         # Reward and metrics flow through `CompileReward`/`CompileMetrics`
         # which already call `rewards.get` / `metrics.get`.
@@ -288,9 +284,6 @@ class Trainer:
                 else "mean"
             ),
         )
-        # Rewards are maximized: lets callbacks resolve `mode="auto"` for
-        # `reward` / `val_reward` without an explicit `mode`.
-        self._reward_tracker.direction = "up"
         self.steps_per_execution = steps_per_execution
 
         self._compile_config = serialization_lib.SerializableDict(
@@ -334,32 +327,6 @@ class Trainer:
     def reset_metrics(self):
         for m in self.metrics:
             m.reset_state()
-
-    def _get_own_metrics(self):
-        metrics = []
-        if self._reward_tracker is not None:
-            metrics.append(self._reward_tracker)
-        if self._compile_metrics is not None:
-            metrics.append(self._compile_metrics)
-        if self._compile_reward is not None:
-            metrics.extend(self._compile_reward.metrics)
-        metrics.extend(self._metrics)
-        return metrics
-
-    def _clear_previous_trainer_metrics(self):
-        for module in self._flatten_modules(include_self=False):
-            if not isinstance(module, Trainer):
-                continue
-            # A submodule might be a Trainer. In that case, we need to clear
-            # the Trainer-related metrics, as they are not usable when a
-            # new Trainer is instantiated.
-            for m in self._get_own_metrics():
-                module._tracker.untrack(m)
-            module._reward_tracker = None
-            module._compile_metrics = None
-            if module._compile_reward is not None:
-                module._compile_reward._metrics.clear()
-            module._metrics.clear()
 
     @property
     def run_eagerly(self):
@@ -537,7 +504,7 @@ class Trainer:
                 `x`.
             batch_size (int): Integer or `None`.
                 Number of samples per batch of computation.
-                If unspecified, `batch_size` will default to 32.
+                Defaults to `1`.
                 Do not specify the `batch_size` if your input data `x` is a
                 Python generator function since they generate batches.
             minibatch_size (int): Integer or `None`.
@@ -616,7 +583,7 @@ class Trainer:
                 samples are used every time.
             validation_batch_size (int): Integer or `None`.
                 Number of samples per validation batch.
-                If unspecified, will default to `batch_size`.
+                Defaults to `32`; if `None`, falls back to `batch_size`.
                 Do not specify the `validation_batch_size` if your data is a
                 `synalinks.utils.PyDataset`, `tf.data.Dataset`,
                 `torch.utils.data.DataLoader` or Python generator function
@@ -673,13 +640,24 @@ class Trainer:
                 "every candidate on it. Pass `validation_split` (a fraction of "
                 "`x` held out) or `validation_data`."
             )
+        if (
+            hasattr(x, "__next__")
+            and steps_per_epoch is None
+            and epochs - initial_epoch > 1
+        ):
+            raise ValueError(
+                "`fit()` got a one-shot generator for `x` with more than one epoch: "
+                "it is exhausted after the first epoch. Pass the re-iterable source "
+                "instead (e.g. the `Dataset` object `ds`, not `ds()`), or set "
+                "`steps_per_epoch`."
+            )
         # Create an iterator that yields batches of input/target data.
         epoch_iterator = EpochIterator(
             x=x,
             y=y,
             batch_size=batch_size,
             steps_per_epoch=steps_per_epoch,
-            shuffle=False,
+            shuffle=shuffle,
             steps_per_execution=self.steps_per_execution,
         )
 
@@ -731,128 +709,135 @@ class Trainer:
             "val_y": val_y if validation_data is not None else None,
         }
         callbacks.on_train_begin()
-        training_logs = None
-        logs = {}
-        initial_epoch = self._initial_epoch or initial_epoch
-
-        if self.trainable_variables and isinstance(
-            self.optimizer, optimizers_module.Optimizer
-        ):
-            await self.optimizer.on_train_begin(
-                self.trainable_variables,
-            )
-
-        for epoch in range(initial_epoch, epochs):
-            self.reset_metrics()
+        try:
+            training_logs = None
+            logs = {}
+            initial_epoch = self._initial_epoch or initial_epoch
+            self._initial_epoch = None  # a restored epoch applies to this fit only
 
             if self.trainable_variables and isinstance(
                 self.optimizer, optimizers_module.Optimizer
             ):
-                await self.optimizer.on_epoch_begin(
-                    epoch,
+                await self.optimizer.on_train_begin(
                     self.trainable_variables,
                 )
 
-            callbacks.on_epoch_begin(epoch)
-            with epoch_iterator.catch_stop_iteration():
-                for step, iterator in epoch_iterator:
-                    data = iterator[0]
-                    x_batch, y_batch = data_adapter_utils.unpack_x_targets(data)
+            for epoch in range(initial_epoch, epochs):
+                self.reset_metrics()
 
-                    if self.trainable_variables and isinstance(
-                        self.optimizer, optimizers_module.Optimizer
-                    ):
-                        await self.optimizer.on_batch_begin(
-                            step,
-                            epoch,
-                            self.trainable_variables,
-                        )
-
-                    callbacks.on_train_batch_begin(step)
-
-                    mini_val_x = None
-                    mini_val_y = None
-                    if minibatch_size:
-                        if len(val_x) > minibatch_size:
-                            indices = stratified_minibatch_indices(
-                                val_y,
-                                minibatch_size,
-                            )
-                            mini_val_x = val_x[indices]
-                            mini_val_y = val_y[indices]
-
-                    logs = await self.train_on_batch(
-                        step=step,
-                        x=x_batch,
-                        y=y_batch,
-                        val_x=mini_val_x if mini_val_x is not None else val_x,
-                        val_y=mini_val_y if mini_val_y is not None else val_y,
-                        return_dict=True,
+                if self.trainable_variables and isinstance(
+                    self.optimizer, optimizers_module.Optimizer
+                ):
+                    await self.optimizer.on_epoch_begin(
+                        epoch,
+                        self.trainable_variables,
                     )
 
-                    if self.trainable_variables and isinstance(
-                        self.optimizer, optimizers_module.Optimizer
-                    ):
-                        await self.optimizer.on_batch_end(
-                            step,
-                            epoch,
-                            self.trainable_variables,
+                callbacks.on_epoch_begin(epoch)
+                with epoch_iterator.catch_stop_iteration():
+                    for step, iterator in epoch_iterator:
+                        data = iterator[0]
+                        x_batch, y_batch = data_adapter_utils.unpack_x_targets(data)
+
+                        if self.trainable_variables and isinstance(
+                            self.optimizer, optimizers_module.Optimizer
+                        ):
+                            await self.optimizer.on_batch_begin(
+                                step,
+                                epoch,
+                                self.trainable_variables,
+                            )
+
+                        callbacks.on_train_batch_begin(step)
+
+                        mini_val_x = None
+                        mini_val_y = None
+                        if minibatch_size:
+                            if len(val_x) > minibatch_size:
+                                indices = stratified_minibatch_indices(
+                                    val_y,
+                                    minibatch_size,
+                                )
+                                mini_val_x = val_x[indices]
+                                mini_val_y = val_y[indices]
+
+                        logs = await self.train_on_batch(
+                            step=step,
+                            x=x_batch,
+                            y=y_batch,
+                            val_x=mini_val_x if mini_val_x is not None else val_x,
+                            val_y=mini_val_y if mini_val_y is not None else val_y,
+                            return_dict=True,
                         )
 
-                    callbacks.on_train_batch_end(step, logs)
-                    if self.stop_training:
-                        break
+                        if self.trainable_variables and isinstance(
+                            self.optimizer, optimizers_module.Optimizer
+                        ):
+                            await self.optimizer.on_batch_end(
+                                step,
+                                epoch,
+                                self.trainable_variables,
+                            )
 
-            # Override with model metrics instead of last step logs if needed.
-            epoch_logs = dict(self._get_metrics_result_or_logs(logs))
+                        callbacks.on_train_batch_end(step, logs)
+                        if self.stop_training:
+                            break
 
-            # Run validation.
-            if validation_data is not None and self._should_eval(epoch, validation_freq):
-                # Create EpochIterator for evaluation and cache it.
-                if getattr(self, "_eval_epoch_iterator", None) is None:
-                    self._eval_epoch_iterator = EpochIterator(
+                # Override with model metrics instead of last step logs if needed.
+                epoch_logs = dict(self._get_metrics_result_or_logs(logs))
+
+                # Run validation.
+                if validation_data is not None and self._should_eval(
+                    epoch, validation_freq
+                ):
+                    # Create EpochIterator for evaluation and cache it.
+                    if getattr(self, "_eval_epoch_iterator", None) is None:
+                        self._eval_epoch_iterator = EpochIterator(
+                            x=val_x,
+                            y=val_y,
+                            batch_size=validation_batch_size or batch_size,
+                            steps_per_execution=self.steps_per_execution,
+                            steps_per_epoch=validation_steps,
+                            shuffle=False,
+                        )
+
+                    val_logs = await self.evaluate(
                         x=val_x,
                         y=val_y,
                         batch_size=validation_batch_size or batch_size,
-                        steps_per_execution=self.steps_per_execution,
-                        steps_per_epoch=validation_steps,
-                        shuffle=False,
+                        steps=validation_steps,
+                        callbacks=callbacks,
+                        _use_cached_eval_dataset=True,
+                    )
+                    val_logs = {"val_" + name: val for name, val in val_logs.items()}
+                    epoch_logs.update(val_logs)
+
+                if self.trainable_variables and isinstance(
+                    self.optimizer, optimizers_module.Optimizer
+                ):
+                    await self.optimizer.on_epoch_end(
+                        epoch,
+                        self.trainable_variables,
+                        logs=epoch_logs,
+                        val_size=len(val_x) if val_x is not None else None,
                     )
 
-                val_logs = await self.evaluate(
-                    x=val_x,
-                    y=val_y,
-                    batch_size=validation_batch_size or batch_size,
-                    steps=validation_steps,
-                    callbacks=callbacks,
-                    _use_cached_eval_dataset=True,
-                )
-                val_logs = {"val_" + name: val for name, val in val_logs.items()}
-                epoch_logs.update(val_logs)
+                callbacks.on_epoch_end(epoch, epoch_logs)
+                training_logs = epoch_logs
+                if self.stop_training:
+                    break
+
+            # If _eval_epoch_iterator exists, delete it after all epochs are done.
+            if getattr(self, "_eval_epoch_iterator", None) is not None:
+                del self._eval_epoch_iterator
 
             if self.trainable_variables and isinstance(
                 self.optimizer, optimizers_module.Optimizer
             ):
-                await self.optimizer.on_epoch_end(
-                    epoch,
-                    self.trainable_variables,
-                    logs=epoch_logs,
-                    val_size=len(val_x) if val_x is not None else None,
-                )
-
-            callbacks.on_epoch_end(epoch, epoch_logs)
-            training_logs = epoch_logs
-            if self.stop_training:
-                break
-
-        # If _eval_epoch_iterator exists, delete it after all epochs are done.
-        if getattr(self, "_eval_epoch_iterator", None) is not None:
-            del self._eval_epoch_iterator
-
-        if self.trainable_variables and isinstance(
-            self.optimizer, optimizers_module.Optimizer
-        ):
-            await self.optimizer.on_train_end(self.trainable_variables)
+                await self.optimizer.on_train_end(self.trainable_variables)
+        except BaseException as e:
+            callbacks.on_train_error(e)
+            raise
 
         callbacks.on_train_end(logs=training_logs)
         self._fit_inputs = None
@@ -966,25 +951,29 @@ class Trainer:
         self.stop_evaluating = False
         self._eval_inputs = {"x": x, "y": y}
         callbacks.on_test_begin()
-        logs = {}
-        self.reset_metrics()
-        for step, iterator in epoch_iterator:
-            callbacks.on_test_batch_begin(step)
-            data = iterator[0]
-            x_batch, y_batch = data_adapter_utils.unpack_x_targets(data)
-            # Only the first step can consume the auto-build's predictions, and
-            # only once: taking it clears it, so every later batch predicts.
-            y_pred, prebuilt_y_pred = prebuilt_y_pred, None
-            logs = await self.test_on_batch(
-                x=x_batch,
-                y=y_batch,
-                return_dict=True,
-                y_pred=y_pred,
-            )
-            callbacks.on_test_batch_end(step, logs)
-            if self.stop_evaluating:
-                break
-        logs = self.get_metrics_result()
+        try:
+            logs = {}
+            self.reset_metrics()
+            for step, iterator in epoch_iterator:
+                callbacks.on_test_batch_begin(step)
+                data = iterator[0]
+                x_batch, y_batch = data_adapter_utils.unpack_x_targets(data)
+                # Only the first step can consume the auto-build's predictions, and
+                # only once: taking it clears it, so every later batch predicts.
+                y_pred, prebuilt_y_pred = prebuilt_y_pred, None
+                logs = await self.test_on_batch(
+                    x=x_batch,
+                    y=y_batch,
+                    return_dict=True,
+                    y_pred=y_pred,
+                )
+                callbacks.on_test_batch_end(step, logs)
+                if self.stop_evaluating:
+                    break
+            logs = self.get_metrics_result()
+        except BaseException as e:
+            callbacks.on_test_error(e)
+            raise
         callbacks.on_test_end(logs)
         self._eval_inputs = None
 
@@ -1016,7 +1005,7 @@ class Trainer:
                 - A Python generator function yielding `(inputs, targets)`.
             batch_size (int): Integer or `None`.
                 Number of samples per batch of computation.
-                If unspecified, `batch_size` will default to 32.
+                If unspecified, each sample is its own batch (`1`).
                 Do not specify the `batch_size` if your input data `x` is a
                 `synalinks.utils.PyDataset`, `tf.data.Dataset`,
                 `torch.utils.data.DataLoader` or Python generator function
@@ -1061,16 +1050,20 @@ class Trainer:
 
         self.stop_predicting = False
         callbacks.on_predict_begin()
-        outputs = []
-        for step, iterator in epoch_iterator:
-            callbacks.on_predict_batch_begin(step)
-            data = iterator[0]
-            x_batch, _ = data_adapter_utils.unpack_x_y(data)
-            batch_outputs = await self.predict_on_batch(x_batch)
-            outputs.extend(batch_outputs)
-            callbacks.on_predict_batch_end(step, {"outputs": batch_outputs})
-            if self.stop_predicting:
-                break
+        try:
+            outputs = []
+            for step, iterator in epoch_iterator:
+                callbacks.on_predict_batch_begin(step)
+                data = iterator[0]
+                x_batch, _ = data_adapter_utils.unpack_x_y(data)
+                batch_outputs = await self.predict_on_batch(x_batch)
+                outputs.extend(batch_outputs)
+                callbacks.on_predict_batch_end(step, {"outputs": batch_outputs})
+                if self.stop_predicting:
+                    break
+        except BaseException as e:
+            callbacks.on_predict_error(e)
+            raise
         callbacks.on_predict_end()
         return np.array(outputs, dtype="object")
 
@@ -1246,19 +1239,6 @@ class Trainer:
             if not self.optimizer.built:
                 run_maybe_nested(self.optimizer.build(self.trainable_variables))
 
-    def _should_reward(self, epoch, validation_freq):
-        epoch = epoch + 1  # one-index the user-facing epoch.
-        if isinstance(validation_freq, int):
-            return epoch % validation_freq == 0
-        elif isinstance(validation_freq, list):
-            return epoch in validation_freq
-        else:
-            raise ValueError(
-                "Expected `validation_freq` to be a list or int. "
-                f"Received: validation_freq={validation_freq} of the "
-                f"type {type(validation_freq)}."
-            )
-
     def _get_metrics_result_or_logs(self, logs):
         """Returns program metrics as a dict if the keys match with input logs.
 
@@ -1309,12 +1289,8 @@ class Trainer:
 
     def _assert_compile_called(self, method_name=None):
         if not self.compiled:
-            msg = "You must call `compile()` before "
-            if metrics_module:
-                msg += "using the program."
-            else:
-                msg += f"calling `{method_name}()`."
-            raise ValueError(msg)
+            action = f"calling `{method_name}()`" if method_name else "using the program"
+            raise ValueError(f"You must call `compile()` before {action}.")
 
     def _auto_build(self, iterator=None, data_batch=None):
         """Build the program, if it is not.
@@ -1363,15 +1339,6 @@ class Trainer:
                 )
         self._post_build()
         return y_pred
-
-    def _assert_compile_called(self, method_name=None):
-        if not self.compiled:
-            msg = "You must call `compile()` before "
-            if metrics_module:
-                msg += "using the model."
-            else:
-                msg += f"calling `{method_name}()`."
-            raise ValueError(msg)
 
     def _should_eval(self, epoch, validation_freq):
         epoch = epoch + 1  # one-index the user-facing epoch.

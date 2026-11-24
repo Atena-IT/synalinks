@@ -6,6 +6,8 @@ from typing import get_args
 from synalinks.src import testing
 from synalinks.src.backend.pydantic.chat_completions import ChatCompletionFunctionCall
 from synalinks.src.backend.pydantic.chat_completions import ChatCompletionMessage
+from synalinks.src.backend.pydantic.chat_completions import ChatCompletionRequest
+from synalinks.src.backend.pydantic.chat_completions import ChatCompletionResponse
 from synalinks.src.backend.pydantic.chat_completions import ChatCompletionToolCall
 from synalinks.src.backend.pydantic.chat_completions import from_chat_completion_message
 from synalinks.src.backend.pydantic.chat_completions import to_chat_completion_message
@@ -34,9 +36,7 @@ def _assistant_with_tool_call():
 class ChatCompletionsTest(testing.TestCase):
     def test_message_api_has_exact_key_parity_with_chat_completion(self):
         # The synalinks message API and the chat-completion wire message
-        # expose exactly the same keys: parity is on names only; value
-        # types may deliberately differ (e.g. parsed-dict tool arguments
-        # vs the JSON-encoded wire string).
+        # expose exactly the same keys and value types.
         self.assertEqual(
             set(ChatMessage.model_fields),
             set(ChatCompletionMessage.model_fields),
@@ -52,6 +52,26 @@ class ChatCompletionsTest(testing.TestCase):
         # Roles too: the ChatRole enum matches the wire role literal.
         wire_roles = get_args(ChatCompletionMessage.model_fields["role"].annotation)
         self.assertEqual({role.value for role in ChatRole}, set(wire_roles))
+        # Value types: identical, except `role` (enum vs literal, checked
+        # above) and `tool_calls` (twin classes, checked key by key above).
+        for name, field in ChatMessage.model_fields.items():
+            if name in ("role", "tool_calls"):
+                continue
+            self.assertEqual(
+                field.annotation,
+                ChatCompletionMessage.model_fields[name].annotation,
+                name,
+            )
+
+    def test_dict_content_is_json_encoded(self):
+        message = ChatMessage(
+            role="tool", tool_call_id="call_0", content={"result": 30.0}
+        )
+        self.assertEqual(message.content, '{"result": 30.0}')
+        self.assertEqual(
+            message.get_json(),
+            {"role": "tool", "content": '{"result": 30.0}', "tool_call_id": "call_0"},
+        )
 
     def test_tool_call_is_nested_on_the_wire(self):
         wire = to_chat_completion_message(_assistant_with_tool_call())
@@ -198,4 +218,59 @@ class ChatCompletionsTest(testing.TestCase):
         restored = from_chat_completion_message(wire)
         self.assertEqual(
             restored.tool_calls[0].function.arguments, '{"expression": "1 + 1"}'
+        )
+
+    def test_envelope_models_accept_real_provider_payloads(self):
+        message = {"role": "assistant", "content": "Paris.", "annotations": []}
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-abc",
+                "created": 1741570283,
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {**message, "provider_specific_fields": {}},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 2,
+                    "total_tokens": 11,
+                    "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
+                },
+                "service_tier": "default",
+            }
+        )
+        self.assertEqual(response.choices[0].message.content, "Paris.")
+        request = ChatCompletionRequest.model_validate(
+            {"model": "gpt-4o", "messages": [message], "verbosity": "low"}
+        )
+        self.assertEqual(request.messages[0].content, "Paris.")
+
+    def test_request_tools_match_the_language_model_wire(self):
+        from synalinks.src.backend.pydantic.chat_completions import (
+            to_chat_completion_request,
+        )
+        from synalinks.src.backend.pydantic.common import ChatMessages
+        from synalinks.src.modules.core.tool import Tool
+        from synalinks.src.modules.language_models.language_model import _tool_to_wire
+
+        async def lookup(term: str):
+            """Look a term up.
+
+            Args:
+                term (str): The term to look up.
+            """
+            return {"result": term}
+
+        tool = Tool(lookup)
+        request = to_chat_completion_request(
+            ChatMessages(messages=[ChatMessage(role=ChatRole.USER, content="hi")]),
+            "gpt-4o-mini",
+            tools=[tool],
+        )
+        self.assertEqual(
+            request.model_dump(exclude_none=True)["tools"], [_tool_to_wire(tool)]
         )

@@ -165,3 +165,9 @@ AUTOBLOG.md
 synalinks-website/
 # Synalinks Gym (nested standalone repo, not part of the framework)
 synalinks-gym/
+
+# Synalinks trace recordings (synalinks.record_traces())
+.synalinks/
+
+# Claude Code task tracker (see CLAUDE.md)
+task_tracker.json

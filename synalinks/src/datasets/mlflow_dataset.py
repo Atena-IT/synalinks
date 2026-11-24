@@ -1,25 +1,16 @@
 # License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
+import mlflow
+from mlflow.genai.datasets import create_dataset
+from mlflow.genai.datasets import get_dataset
+
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend.config import mlflow_tracking_uri
 from synalinks.src.datasets.dataset import Dataset
 
-try:
-    import mlflow
-    from mlflow.genai.datasets import create_dataset
-    from mlflow.genai.datasets import get_dataset
-
-    MLFLOW_AVAILABLE = True
-except ImportError:
-    MLFLOW_AVAILABLE = False
-
 
 def _set_tracking_uri(tracking_uri):
     """Point MLflow at the given store, or at `synalinks.enable_observability()`'s."""
-    if not MLFLOW_AVAILABLE:
-        raise ImportError(
-            "mlflow is required for `MLflowDataset`. Install it with: pip install mlflow"
-        )
     tracking_uri = tracking_uri or mlflow_tracking_uri()
     if tracking_uri:
         mlflow.set_tracking_uri(tracking_uri)
@@ -59,7 +50,7 @@ class MLflowDataset(Dataset):
         output_template='{"answer": {{ expectations.answer | tojson }}}',
         batch_size=8,
     )
-    program.evaluate(x=ds())
+    await program.evaluate(x=ds)
 
     # Push in-memory arrays to MLflow; each example becomes one record with
     # its input JSON under `inputs` and its target JSON under `expectations`.

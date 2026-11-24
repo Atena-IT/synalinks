@@ -1,5 +1,6 @@
 # License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
+import inspect
 from typing import Any
 from typing import Dict
 from typing import List
@@ -53,15 +54,18 @@ class KnowledgeBase(SynalinksSaveable):
     )
 
     # Store a document
-    doc = Document(id="1", title="Hello", content="Hello World!")
+    doc = Document(id="1", title="Greeting", content="Hello World!")
     await knowledge_base.update(doc.to_json_data_model())
 
     # Retrieve by ID (the first field, here 'id', is the primary key; see
     # the "Primary Key Convention" section below).
     result = await knowledge_base.get("1", table_name="Document")
 
-    # Full-text search
-    results = await knowledge_base.fulltext_search("Hello", k=10)
+    # Full-text search ("hello" itself is an English stopword on DuckDB,
+    # see the `stopwords=` adapter option)
+    results = await knowledge_base.fulltext_search(
+        "World", table_name="Document", k=10
+    )
     ```
 
     ### Primary Key Convention
@@ -103,7 +107,9 @@ class KnowledgeBase(SynalinksSaveable):
     )
 
     # Hybrid search (combines BM25 fulltext + vector similarity, fused by RRF)
-    results = await knowledge_base.hybrid_fts_search("semantic query", k=10)
+    results = await knowledge_base.hybrid_fts_search(
+        "semantic query", table_name="Document", k=10
+    )
     ```
 
     ### Retrieving Table Definitions
@@ -118,7 +124,10 @@ class KnowledgeBase(SynalinksSaveable):
     ```
 
     Args:
-        uri (str): SQL store connection URI (``"duckdb://path/to/db.db"``).
+        uri (str): SQL store connection URI: DuckDB
+            (``"duckdb://path/to/db.db"`` or ``"duckdb://:memory:"``) or
+            LanceDB (``"lancedb://path/to/folder.lance"`` or
+            ``"lancedb://:memory:"``).
             When both ``uri`` and ``graph_uri`` are omitted, defaults to
             ``{synalinks_home()}/{name or 'database'}.db``. Pass ``uri``
             alone to opt out of the graph-side default.
@@ -140,7 +149,8 @@ class KnowledgeBase(SynalinksSaveable):
         metric (str): The distance metric for vector search.
             Options: "cosine", "l2sq", "ip" (default: "cosine").
         wipe_on_start (bool): Whether to clear the database on initialization
-            (default: False).
+            (default: False). Not saved by `get_config()`, so reloading a
+            knowledge base never wipes it.
         name (str): Optional name for the knowledge base (used for serialization
             and as the filename stem for the default ``.synalinks`` paths).
         encryption_key (str): Optional at-rest encryption key for the SQL
@@ -184,6 +194,22 @@ class KnowledgeBase(SynalinksSaveable):
         want_sql = uri is not None or auto_pair
         want_graph = graph_uri is not None or auto_pair
 
+        # Extra keyword arguments are options of the selected adapters.
+        accepted = set()
+        if want_sql:
+            accepted |= set(inspect.signature(database_adapters.get(uri)).parameters)
+        if want_graph:
+            accepted |= set(
+                inspect.signature(graph_database_adapters.get(graph_uri)).parameters
+            )
+        unknown = sorted(set(kwargs) - accepted)
+        if unknown:
+            raise TypeError(
+                f"KnowledgeBase got unexpected keyword argument(s) {unknown}: "
+                "they are neither KnowledgeBase arguments nor options of its "
+                "adapters."
+            )
+
         if want_sql:
             self.sql_adapter = database_adapters.get(uri)(
                 uri=uri,
@@ -221,10 +247,10 @@ class KnowledgeBase(SynalinksSaveable):
         self.embedding_model = _get_em(embedding_model)
         self.metric = metric
         self.wipe_on_start = wipe_on_start
-        if not name:
-            self.name = auto_name("knowledge_base")
-        else:
-            self.name = name
+        # The given name (not the auto one) picks the adapters' default file stem.
+        self._name_arg = name
+        self.name = name or auto_name("knowledge_base")
+        self._adapter_kwargs = kwargs
         # `encryption_key` is deliberately NOT stored on `self`: it
         # lives only inside the adapter, and only as long as the
         # adapter does. This keeps the secret out of `get_config()`,
@@ -594,7 +620,7 @@ class KnowledgeBase(SynalinksSaveable):
         self,
         sql: str,
         *,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[Union[List[Any], Dict[str, Any]]] = None,
         output_format: str = "json",
         **kwargs,
     ) -> Union[List[Dict[str, Any]], str]:
@@ -606,7 +632,8 @@ class KnowledgeBase(SynalinksSaveable):
 
         Args:
             sql (str): The SQL string to execute.
-            params (dict): Optional list of parameters for parameterized queries.
+            params (list | dict): Optional query parameters: a list for ``?``
+                placeholders, or a dict for ``$name`` placeholders.
             output_format: ``"json"`` (default, list of dicts,
                 JSON-shaped Python data) or ``"csv"`` (CSV string,
                 useful when handing the result to an LM).
@@ -632,6 +659,9 @@ class KnowledgeBase(SynalinksSaveable):
                    Without this layer,
                    ``SELECT * FROM read_csv('/etc/passwd', ...)`` would pass
                    defence (1) because it is a syntactically valid ``SELECT``.
+
+                ``read_only`` only applies to ``duckdb://``: ``lancedb://``
+                stores are always ``SELECT``-only, whatever its value.
 
                 Pass ``read_only=False`` only from trusted call sites that
                 genuinely need to mutate state. Those paths still run on
@@ -2113,9 +2143,9 @@ class KnowledgeBase(SynalinksSaveable):
         config = {
             "uri": self.uri,
             "graph_uri": self.graph_uri,
-            "name": self.name,
+            "name": self._name_arg,
             "metric": self.metric,
-            "wipe_on_start": self.wipe_on_start,
+            **self._adapter_kwargs,
         }
         data_models_config = {
             "data_models": self._serialize_models(self.data_models, "data_model"),

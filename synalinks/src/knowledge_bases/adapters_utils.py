@@ -3,7 +3,9 @@
 
 Keeping these in one place stops the DuckDB and Ladybug adapters from
 drifting on shared concerns (output formatting and per-query keyword
-alignment) that have nothing to do with the underlying engine.
+alignment) that have nothing to do with the underlying engine, and gives the
+modules that describe a knowledge base to a language model (the SQL, Cypher
+and VectorRAG agents, Text2SQL, Text2Cypher) one rendering of its schemas.
 """
 
 import io
@@ -13,6 +15,7 @@ from typing import List
 from typing import Optional
 from typing import Union
 
+import orjson
 import pyarrow as pa
 import pyarrow.csv as pa_csv
 
@@ -84,6 +87,35 @@ def to_snake_identifier(name: str, *, strict: bool = True) -> Optional[str]:
             raise ValueError(f"Invalid identifier: {name!r}")
         return None
     return normalized
+
+
+def resolve_ref(spec: dict, defs: dict) -> dict:
+    """Inline a Pydantic v2 ``$ref`` (``#/$defs/Foo``) into a property spec.
+
+    Keys set on the referring spec (e.g. ``default``) override the
+    resolved definition. A spec without ``$ref`` is returned as is.
+    """
+    ref = spec.get("$ref")
+    if not ref:
+        return spec
+    resolved = dict(defs.get(ref.rsplit("/", 1)[-1], {}))
+    resolved.update({k: v for k, v in spec.items() if k != "$ref"})
+    return resolved
+
+
+def json_columns(schema: dict) -> set:
+    """Return the snake-cased columns stored as JSON strings: objects and
+    arrays of objects (``$ref`` resolved)."""
+    defs = schema.get("$defs", {})
+    cols = set()
+    for raw_name, raw_spec in schema.get("properties", {}).items():
+        spec = resolve_ref(raw_spec, defs)
+        if spec.get("type") == "object" or (
+            spec.get("type") == "array"
+            and resolve_ref(spec.get("items", {}), defs).get("type") == "object"
+        ):
+            cols.add(to_snake_identifier(raw_name))
+    return cols
 
 
 def resolve_db_path(
@@ -159,6 +191,16 @@ def format_search_results(arrow_or_records, output_format: str):
         if not arrow_or_records:
             return ""
         arrow_table = pa.Table.from_pylist(arrow_or_records)
+    for i, field in enumerate(arrow_table.schema):
+        if pa.types.is_nested(field.type):
+            # CSV cannot hold lists/structs (embeddings, graph nodes): write them as JSON.
+            values = [
+                None if v is None else orjson.dumps(v, default=str).decode()
+                for v in arrow_table.column(i).to_pylist()
+            ]
+            arrow_table = arrow_table.set_column(
+                i, field.name, pa.array(values, pa.string())
+            )
     buf = io.BytesIO()
     pa_csv.write_csv(arrow_table, buf)
     return buf.getvalue().decode("utf-8")
@@ -269,3 +311,29 @@ def align_keywords(
             f"got {len(keyword_list)} keyword(s) vs {len(texts)} text(s)."
         )
     return texts, keyword_list
+
+
+def format_schema_columns(properties, skip=()):
+    """Render a schema's `properties` as `  - name (type): description` lines.
+
+    Properties named in `skip` are left out (a label already in the heading,
+    a relation's endpoints).
+    """
+    return [
+        f"  - {name} ({info.get('type', info.get('const', 'unknown'))}): "
+        f"{info.get('description', '')}"
+        for name, info in properties.items()
+        if name not in skip
+    ]
+
+
+def unknown_title_error(models, title, kind):
+    """The tool error for a `title` (a table name or a label) none of `models` has.
+
+    Returns `None` when one of them has it; `kind` names it in the error
+    (`"Table"`, `"Node label"`).
+    """
+    available = [m.get_schema().get("title", "Unknown") for m in models]
+    if title in available:
+        return None
+    return {"error": f"{kind} {title!r} not found. Available: {available}"}

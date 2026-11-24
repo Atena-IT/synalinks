@@ -23,6 +23,9 @@ from synalinks.src.backend import is_chat_messages
 from synalinks.src.modules.agents.function_calling_agent import FunctionCallingAgent
 from synalinks.src.modules.agents.utils.agents_utils import InputsSummary
 from synalinks.src.modules.agents.utils.agents_utils import call_tool
+from synalinks.src.modules.agents.utils.agents_utils import check_public_tool_name
+from synalinks.src.modules.agents.utils.agents_utils import discard_subagent_branch
+from synalinks.src.modules.agents.utils.agents_utils import spawn_subagents_on_forks
 from synalinks.src.modules.agents.utils.agents_utils import summarize_inputs
 from synalinks.src.modules.agents.utils.agents_utils import tool_message_content
 from synalinks.src.modules.core.tool import Tool
@@ -186,6 +189,8 @@ _JSON_TO_PY_TYPES = {
 
 def _annotation_from_schema(param_schema: dict) -> str:
     """Best-effort Python type annotation for a parameter's JSON schema."""
+    if "anyOf" in param_schema:
+        return " | ".join(_annotation_from_schema(s) for s in param_schema["anyOf"])
     json_type = param_schema.get("type")
     if isinstance(json_type, list):
         parts = []
@@ -354,8 +359,8 @@ def get_sandbox_functions_guidance(schema, tools) -> str:
                     param += f" = {param_schema.get('default')!r}"
                 params.append(param)
                 description = str(param_schema.get("description") or "").strip()
-                if any(
-                    k in param_schema for k in ("properties", "enum", "anyOf", "oneOf")
+                if any(k in param_schema for k in ("properties", "enum", "oneOf")) or any(
+                    set(s) - {"type"} for s in param_schema.get("anyOf", [])
                 ):
                     structural = {
                         k: v
@@ -630,23 +635,6 @@ requires and report concisely what you computed and changed.
 """.strip()
 
 
-def _subagent_answer(output) -> str:
-    """Extract a subagent's final answer text from its (schemaless) output."""
-    if output is None:
-        return ""
-    data = output.get_json() if hasattr(output, "get_json") else output
-    if isinstance(data, dict):
-        messages = data.get("messages")
-        if messages:
-            last = messages[-1]
-            content = last.get("content") if isinstance(last, dict) else None
-            if isinstance(content, str):
-                return content
-            return "" if content is None else json.dumps(content, ensure_ascii=False)
-        return json.dumps(data, ensure_ascii=False)
-    return str(data)
-
-
 @synalinks_export(
     [
         "synalinks.modules.RecursiveLanguageModelAgent",
@@ -768,7 +756,7 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
         final_instructions (str): Optional. Instructions for the final
             answer generator. Defaults to ``instructions``.
         temperature (float): Optional. Sampling temperature
-            (Default 0.0).
+            (Default None, the model's own default).
         max_tokens (int): Optional. Maximum number of tokens to generate.
             Default None (the model's own default; caps generation length).
         top_p (float): Optional. Nucleus sampling probability. Default None
@@ -861,9 +849,9 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
             advertised as ``def`` stubs in the prompt.
         skills (list): Optional. Folder paths (Agent Skill roots) whose skills
             are rendered for the agent as an ``<available_skills>`` prompt block
-            (see `FunctionCallingAgent`). The skill files must also be reachable
-            from the agent's sandbox (e.g. under ``workdir``) for their bodies to
-            be read on demand. Defaults to ``None``.
+            (see `FunctionCallingAgent`). The built-in ``read_skill`` tool reads
+            a skill's ``SKILL.md`` from these host folders on demand, so they
+            need not be reachable from the sandbox. Defaults to ``None``.
         sandbox (Sandbox): Optional. A pre-built ``Sandbox`` instance to
             reuse across calls. When supplied, the agent will not build
             its own sandbox at ``call()`` time and ``sandbox_type`` is
@@ -1053,7 +1041,20 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
         # (advertised as `def` stubs in the instructions) rather than as
         # native tool calls. Reject reserved helper names here, after the
         # base's public-name check.
-        reserved = self._reserved_tool_names()
+        # Reserved even when `recursive=False` or subagents are off, so tool
+        # naming stays stable across settings: a user tool cannot quietly shadow
+        # a helper that would reappear when a setting is flipped back on.
+        reserved = frozenset(
+            {
+                "submit",
+                "llm_query",
+                "llm_query_batched",
+                "run_python_code",
+                "spawn_subagents",
+                "merge_subagent",
+                "discard_subagent",
+            }
+        )
         for tool_name in self.tools:
             if tool_name in reserved:
                 raise ValueError(
@@ -1071,13 +1072,7 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
         # routinely try anyway and get `Unknown tool` back.
         self.native_tools = {}
         for tool in native_tools or []:
-            if tool.name.startswith("_"):
-                raise ValueError(
-                    f"Tool name {tool.name!r} starts with an underscore. "
-                    f"Tools exposed to the LM must have public names; "
-                    f"rename the function or pass an explicit `name=` to "
-                    f"Tool(...)."
-                )
+            check_public_tool_name(tool)
             if tool.name in reserved:
                 raise ValueError(
                     f"Tool name '{tool.name}' is reserved by {type(self).__name__}."
@@ -1101,54 +1096,6 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
         # `run_python_code` (built per call) is always available, so a user may
         # construct an RLM agent with no tools at all.
         return False
-
-    def _reserved_tool_names(self) -> frozenset:
-        """Names a user tool cannot collide with at construction time.
-
-        ``submit``, ``llm_query``, and ``llm_query_batched`` are always
-        reserved, even when ``recursive=False``, so that tool naming
-        stays stable across the two modes and a user tool can't quietly
-        shadow a helper name that would reappear if ``recursive`` is
-        flipped back on. The subagent helpers are reserved too, for the
-        same stability across ``max_subagent_depth`` settings.
-        """
-        return frozenset(
-            {
-                "submit",
-                "llm_query",
-                "llm_query_batched",
-                "run_python_code",
-                "spawn_subagents",
-                "merge_subagent",
-                "discard_subagent",
-            }
-        )
-
-    def _build_extra_call_tools(self) -> dict:
-        """Build the per-call recursive helpers when ``recursive=True``.
-
-        A fresh counter+lock is built on every invocation so concurrent
-        calls into the same agent instance get independent budgets.
-        Returns ``{}`` when ``recursive=False``.
-        """
-        if not self.recursive:
-            return {}
-        counter = {"value": 0}
-        lock = asyncio.Lock()
-        return {
-            "llm_query": _build_llm_query_tool(
-                self.sub_language_model,
-                self.max_llm_calls,
-                counter,
-                lock,
-            ),
-            "llm_query_batched": _build_llm_query_batched_tool(
-                self.sub_language_model,
-                self.max_llm_calls,
-                counter,
-                lock,
-            ),
-        }
 
     def _build_run_python_code_tool(self, sandbox):
         """Build the lone tool the LM can call.
@@ -1216,8 +1163,6 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
         a handle ``counter``, and ``repl_state`` tracking the single REPL
         adoption allowed per turn.
         """
-        from synalinks.src.modules.core.input_module import Input
-        from synalinks.src.programs.program import Program
 
         async def spawn_subagents(tasks: List[str]) -> dict:
             """Run subagents in parallel, each on an isolated fork of the sandbox.
@@ -1242,28 +1187,13 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
                 is empty.
             """
             prompts = [str(t) for t in (tasks or [])]
-            if not prompts:
-                return {"error": "no tasks provided"}
-
-            async def run_one(index, prompt):
-                # Subagents inherit the parent's confinement (``confine=None``):
-                # when this sandbox is confined, the subagent is confined to its
-                # OWN fork (host hidden, network cut, isolated filesystem, and
-                # the parent's egress/mount/seccomp posture); when the parent
-                # runs unconfined, so does the subagent.
-                (fork,) = await sandbox.fork(name=f"{self.name}_sub{index}", confine=None)
-                if isinstance(fork, Exception):
-                    raise fork
-                # The fork is closed the moment the subagent is done, however
-                # it ended; its branch (files and REPL) is kept as a snapshot,
-                # which `merge_subagent` applies as it would the fork.
-                try:
-                    return await run_subagent(index, prompt, fork)
-                finally:
-                    await release_resource(fork)
-
-            async def run_subagent(index, prompt, fork):
-                subagent = RecursiveLanguageModelAgent(
+            # Handles are reserved up front so concurrent spawns never share one.
+            start = counter[0]
+            counter[0] += len(prompts)
+            return await spawn_subagents_on_forks(
+                sandbox,
+                prompts,
+                lambda index, fork: RecursiveLanguageModelAgent(
                     language_model=self.sub_language_model,
                     sub_language_model=self.sub_language_model,
                     sandbox=fork,
@@ -1283,50 +1213,11 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
                     return_inputs_with_trajectory=False,
                     autonomous=True,
                     name=f"{self.name}_sub{index}",
-                )
-                # Run through a Program (the canonical path): it builds once
-                # against a symbolic Input and gets the standard lifecycle.
-                inp = Input(data_model=ChatMessages)
-                out = await subagent(inp)
-                program = Program(
-                    inputs=inp, outputs=out, name=f"{self.name}_sub{index}_prog"
-                )
-                messages = ChatMessages(
-                    messages=[ChatMessage(role=ChatRole.USER, content=prompt)]
-                )
-                result = await program(messages)
-                snapshot = await fork.snapshot() if hasattr(fork, "snapshot") else fork
-                return snapshot, _subagent_answer(result)
-
-            results = await asyncio.gather(
-                *(run_one(i, p) for i, p in enumerate(prompts)),
-                return_exceptions=True,
+                ),
+                name=self.name,
+                registry=registry,
+                start=start,
             )
-            report = []
-            for prompt, res in zip(prompts, results):
-                handle = f"subagent_{counter[0]}"
-                counter[0] += 1
-                if isinstance(res, Exception):
-                    report.append(
-                        {
-                            "handle": handle,
-                            "task": prompt,
-                            "error": f"{type(res).__name__}: {res}",
-                        }
-                    )
-                    continue
-                branch, answer = res
-                registry[handle] = branch
-                report.append(
-                    {
-                        "handle": handle,
-                        "task": prompt,
-                        "result": answer,
-                        "diff": branch.diff(),
-                        "patch": branch.patch(),
-                    }
-                )
-            return {"subagents": report}
 
         async def merge_subagent(
             handle: str,
@@ -1384,9 +1275,7 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
                 dict: ``{discarded: handle}``, or ``error`` for an unknown
                 handle.
             """
-            if registry.pop(handle, None) is None:
-                return {"error": f"unknown subagent handle: {handle!r}"}
-            return {"discarded": handle}
+            return discard_subagent_branch(registry, handle)
 
         return {
             "spawn_subagents": Tool(spawn_subagents, name="spawn_subagents"),
@@ -1403,7 +1292,17 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
         call_tools = dict(self.tools)
         submit_holder = {"value": None}
         call_tools["submit"] = _build_submit_tool(self.schema, submit_holder)
-        call_tools.update(self._build_extra_call_tools())
+        if self.recursive:
+            # A fresh counter and lock per call: concurrent calls into the same
+            # agent get independent `max_llm_calls` budgets.
+            counter = {"value": 0}
+            lock = asyncio.Lock()
+            call_tools["llm_query"] = _build_llm_query_tool(
+                self.sub_language_model, self.max_llm_calls, counter, lock
+            )
+            call_tools["llm_query_batched"] = _build_llm_query_batched_tool(
+                self.sub_language_model, self.max_llm_calls, counter, lock
+            )
 
         if is_chat_messages(inputs):
             trajectory = inputs
@@ -1520,9 +1419,6 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
         # passed as `native_tools=`; everything in `tools=` / `sandbox_tools=`
         # is reachable from inside the sandbox instead, not as a native call.
         return ctx["native_tools"]
-
-    def _requires_tools(self):
-        return False
 
     # RLM answers through `submit()` inside a snippet, its own output tool: no
     # `final_answer` tool, and a step's text is never the answer.
@@ -1754,6 +1650,10 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
                     if self.sandbox is not None
                     else None
                 ),
+                "native_tools": [
+                    serialization_lib.serialize_synalinks_object(tool)
+                    for tool in self.native_tools.values()
+                ],
             }
         )
         return config
@@ -1777,4 +1677,8 @@ class RecursiveLanguageModelAgent(FunctionCallingAgent):
             )
         else:
             config.pop("sandbox", None)
+        config["native_tools"] = [
+            serialization_lib.deserialize_synalinks_object(tool)
+            for tool in config.pop("native_tools", [])
+        ] or None
         return super().from_config(config)

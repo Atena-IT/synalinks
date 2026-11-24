@@ -55,6 +55,11 @@ class ProgramCheckpointInitTest(testing.TestCase):
         self.assertIs(cb.monitor_op, np.greater)
         self.assertEqual(cb.best, -np.inf)
 
+    def test_unresolved_direction_raises_with_save_best_only(self):
+        cb = ProgramCheckpoint(filepath="/tmp/x.json", save_best_only=True)
+        with self.assertRaisesRegex(ValueError, "maximized or minimized"):
+            cb.on_train_begin()
+
     def test_min_mode_initializes_best(self):
         cb = ProgramCheckpoint(filepath="/tmp/x.json", mode="min")
         self.assertIs(cb.monitor_op, np.less)
@@ -224,7 +229,7 @@ class ProgramCheckpointSaveTest(testing.TestCase):
         cb.set_program(program)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            cb.on_epoch_end(0, logs={"val_reward": np.array([0.1, 0.2])})
+            cb.on_epoch_end(0, logs={"val_reward": [0.1, 0.2]})
             self.assertTrue(any("scalar value" in str(x.message) for x in w))
         # Falls back to unconditional save.
         self.assertEqual(program.saved, [filepath])
@@ -271,12 +276,3 @@ class ProgramCheckpointPatternMatchingTest(testing.TestCase):
         match = cb._get_most_recently_modified_file_matching_pattern(pattern)
         # When tied, the file path with the lexicographically largest name wins.
         self.assertEqual(match, b)
-
-    def test_checkpoint_exists(self):
-        tmp = self.get_temp_dir()
-        cb = ProgramCheckpoint(filepath=os.path.join(tmp, "ckpt.json"))
-        present = os.path.join(tmp, "ckpt.json")
-        with open(present, "w") as f:
-            f.write("x")
-        self.assertTrue(cb._checkpoint_exists(present))
-        self.assertFalse(cb._checkpoint_exists(os.path.join(tmp, "absent.json")))

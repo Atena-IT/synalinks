@@ -156,6 +156,19 @@ class EarlyStoppingBehaviorTest(testing.TestCase):
         # Stopped via stop_at branch, so stopped_epoch remains 0.
         self.assertEqual(cb.stopped_epoch, 0)
 
+    def test_default_stop_at_ignores_min_mode_and_warmup(self):
+        cb = EarlyStopping(monitor="val_cost", mode="min", patience=5)
+        self.assertFalse(_run(cb, [3.2]).stop_training)
+        cb = EarlyStopping(monitor="val_reward", mode="max", start_from_epoch=3)
+        self.assertFalse(_run(cb, [1.0]).stop_training)
+        cb = EarlyStopping(monitor="val_reward", mode="max", patience=5)
+        self.assertTrue(_run(cb, [1.0]).stop_training)
+
+    def test_explicit_stop_at_in_min_mode(self):
+        cb = EarlyStopping(monitor="val_cost", mode="min", patience=5, stop_at=0.5)
+        program = _run(cb, [3.2, 0.4])
+        self.assertTrue(program.stop_training)
+
     def test_baseline_required_to_reset_wait(self):
         # The first value sets `best`. Subsequent values fail to improve on
         # `best`, and since the baseline is never beaten the wait counter
@@ -172,6 +185,12 @@ class EarlyStoppingBehaviorTest(testing.TestCase):
             value = cb.get_monitor_value({"other": 0.5})
             self.assertIsNone(value)
             self.assertTrue(any("not available" in str(x.message) for x in w))
+
+    def test_non_scalar_monitor_raises(self):
+        cb = EarlyStopping(monitor="val_f1_score", mode="max")
+        cb.set_program(_FakeProgram())
+        with self.assertRaisesRegex(ValueError, "scalar metric"):
+            cb.get_monitor_value({"val_f1_score": [1.0, 0.5]})
 
 
 class EarlyStoppingRestoreVariablesTest(testing.TestCase):
@@ -248,5 +267,6 @@ class EarlyStoppingRealProgramTest(testing.TestCase):
         var.assign(mutated)
         self.assertIn("__probe__", var.get_json())
 
-        cb._restore_variables(snapshot)
+        cb.best_variables = snapshot
+        cb.on_train_end()
         self.assertEqual(var.get_json(), before)

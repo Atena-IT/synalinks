@@ -376,6 +376,43 @@ class TestTrainer(testing.TestCase):
 
         self.assertAlmostEqual(program._reward_tracker.result(), 2 / 3)
 
+    async def test_fit_one_shot_generator_with_many_epochs_raises(self):
+        program = await program_test()
+        program.compile(
+            optimizer=optimizers.random_few_shot.RandomFewShot(),
+            reward=rewards.ExactMatch(in_mask=["answer"]),
+        )
+        (x, y), (x_test, y_test) = load_test_data()
+        batches = ((x[i : i + 1], y[i : i + 1]) for i in range(len(x)))
+        with self.assertRaisesRegex(ValueError, "one-shot generator"):
+            await program.fit(x=batches, epochs=2, validation_data=(x_test, y_test))
+
+    @patch("litellm.acompletion")
+    async def test_fit_shuffle_is_forwarded(self, mock_completion):
+        mock_answer = AnswerWithRationale(rationale="r", answer="Paris")
+        mock_completion.return_value = {
+            "choices": [{"message": {"content": json.dumps(mock_answer.get_json())}}]
+        }
+        (x, y), _ = load_test_data()
+        for shuffle in (False, True):
+            program = await program_test()
+            program.compile(
+                optimizer=optimizers.random_few_shot.RandomFewShot(),
+                reward=rewards.ExactMatch(in_mask=["answer"]),
+            )
+            seen = []
+            train_on_batch = program.train_on_batch
+
+            async def record(step, x, y=None, **kwargs):
+                seen.append([q.query for q in x])
+                return await train_on_batch(step, x, y, **kwargs)
+
+            program.train_on_batch = record
+            np.random.seed(0)
+            await program.fit(x=x, y=y, batch_size=4, epochs=2, shuffle=shuffle)
+            epochs = seen[: len(seen) // 2], seen[len(seen) // 2 :]
+            self.assertEqual(epochs[0] == epochs[1], not shuffle)
+
     async def test_fit_without_validation_data_says_why(self):
         program = await program_test()
         program.compile(
@@ -445,7 +482,7 @@ class TestCompiledMetricIsolation(testing.TestCase):
 
     async def test_shared_operational_metric_binds_per_program(self):
         from synalinks.src.metrics.lm_metrics import Cost
-        from synalinks.src.metrics.lm_metrics import _collect_language_models
+        from synalinks.src.metrics.metrics_utils import language_models
 
         model_names = ["ollama/model-a", "ollama/model-b", "ollama/model-c"]
         costs = [0.01, 0.02, 0.03]
@@ -460,7 +497,7 @@ class TestCompiledMetricIsolation(testing.TestCase):
 
         # Each model runs and accumulates its OWN provider cost.
         for program, cost in zip(progs, costs):
-            _collect_language_models(program)[0].inference_cumulated_cost += cost
+            language_models(program)[0].inference_cumulated_cost += cost
 
         bound = [self._bound_op_metric(p) for p in progs]
 
@@ -469,7 +506,7 @@ class TestCompiledMetricIsolation(testing.TestCase):
         # ...reading only its own model's counters.
         for program, metric, cost in zip(progs, bound, costs):
             self.assertEqual(
-                _collect_language_models(program),
+                language_models(program),
                 metric.language_models,
             )
             self.assertAlmostEqual(metric.result(), cost)
