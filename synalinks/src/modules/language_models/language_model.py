@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import warnings
+from typing import NamedTuple
 
 import litellm
 import orjson
@@ -150,6 +151,16 @@ _CACHE_CREATION_TTL_KEYS = (
 # Usage of the LM call running in the current task, read by hooks (the MLflow
 # `Monitor` hook writes it as span attributes). A ContextVar rather than an
 # instance attribute so concurrent calls on one LM never see each other's.
+class _PreparedRequest(NamedTuple):
+    """What `LanguageModel._prepare_request` builds for one call."""
+
+    messages: list
+    schema: dict | None
+    schema_had_thinking: bool
+    streaming: bool
+    kwargs: dict
+
+
 _CURRENT_CALL_USAGE = contextvars.ContextVar("synalinks_lm_call_usage", default=None)
 
 
@@ -950,6 +961,102 @@ class LanguageModel(Module):
         self.last_call_finish_reason = None
         _CURRENT_CALL_USAGE.set(None)
         input_kwargs = copy.deepcopy(kwargs)
+        prepared = await self._prepare_request(
+            messages,
+            schema,
+            tools,
+            tool_schemas,
+            streaming,
+            kwargs,
+            resolve_media=True,
+        )
+        formatted_messages, schema, schema_had_thinking, streaming, kwargs = prepared
+        # Persistent on-disk cache: keyed by the fully-formatted request
+        # (model, wire messages, schema and final kwargs), so any change to
+        # prompts, tools or generation parameters yields a different entry.
+        # The `stream` flag is excluded from the key: a streamed call stores
+        # the same assistant ChatMessage a non-streamed schema-less call does
+        # (streaming forces schema=None), so both share one entry; a hit is
+        # replayed as a single-chunk stream when `streaming=True`.
+        cache_key = None
+        if self._file_cache is not None:
+            cache_key = self._file_cache.make_key(
+                {
+                    "model": self.model,
+                    "messages": formatted_messages,
+                    "schema": schema,
+                    "kwargs": {k: v for k, v in kwargs.items() if k != "stream"},
+                }
+            )
+            if cache_key is not None:
+                cached_json = self._file_cache.get(cache_key)
+                if cached_json is not None:
+                    self._record_event("cache_hits")
+                    _CURRENT_CALL_USAGE.set({"cache_hit": True})
+                    if streaming:
+                        return StreamingIterator(_cached_message_to_chunks(cached_json))
+                    return JsonDataModel(
+                        json=cached_json,
+                        schema=schema if schema else ChatMessage.get_schema(),
+                        name=f"{self.name}_response",
+                    )
+        try:
+            response = await self._call_with_retry(
+                formatted_messages,
+                schema,
+                streaming,
+                schema_had_thinking,
+                **kwargs,
+            )
+            if cache_key is not None and response is not None:
+                if streaming:
+                    # Cache once the caller drains the stream; an abandoned
+                    # stream is incomplete and is not cached.
+                    file_cache = self._file_cache
+                    response._on_complete = lambda json_instance: file_cache.set(
+                        cache_key, json_instance
+                    )
+                else:
+                    self._file_cache.set(cache_key, response.get_json())
+            return response
+        except Exception as e:
+            warnings.warn(f"All retries failed for {self}: {e}")
+            self._record_event("failed_calls")
+            if self.fallback:
+                self._record_event("fallback_activations")
+                response = await self.fallback(
+                    messages,
+                    schema=schema,
+                    tools=tools,
+                    tool_schemas=tool_schemas,
+                    streaming=streaming,
+                    **input_kwargs,
+                )
+                # The fallback's usage is reported on its own span: this call
+                # only reports its failure.
+                _CURRENT_CALL_USAGE.set({"error": str(e), "fallback": True})
+                return response
+            else:
+                _CURRENT_CALL_USAGE.set({"error": str(e)})
+                return None
+
+    async def _prepare_request(
+        self, messages, schema, tools, tool_schemas, streaming, kwargs, resolve_media
+    ):
+        """Build the request a call sends: wire messages, final schema and kwargs.
+
+        The one building path of `call()` and `build_request()`, so what a
+        caller is told would be sent is what is sent. Reads only what the
+        model declares (`supports_reasoning`, `supports_vision`,
+        `supports_audio`): no request leaves. `resolve_media` inlines the
+        deferred media references of the messages (a URL or a path, fetched
+        or read); `build_request()` leaves them as given.
+
+        Returns:
+            (_PreparedRequest): the wire messages, the schema the LM is asked
+                for, whether it had a `thinking` field, whether the call
+                streams, and the final kwargs.
+        """
         # Merge instance-level defaults; per-call kwargs win.
         kwargs = {**self.default_kwargs, **kwargs}
         schema = copy.deepcopy(schema)
@@ -972,7 +1079,8 @@ class LanguageModel(Module):
         # Inline any deferred multimodal references (a dataset's image_url/
         # input_audio parts carrying a url/path) into base64 payloads, for this
         # batch only. Content already inlined at construction is left untouched.
-        formatted_messages = await resolve_content_media(formatted_messages)
+        if resolve_media:
+            formatted_messages = await resolve_content_media(formatted_messages)
         # Media returned by tools (a sandbox plot, a `read_image`, a
         # `read_audio`): images stay inside the tool result for the models
         # that take them there (Claude's `tool_result`, Gemini 3's multimodal
@@ -1271,74 +1379,65 @@ class LanguageModel(Module):
                 "cache_control": {"type": "ephemeral"},
             }
             formatted_messages[0] = system_message_with_cache_control
-        # Persistent on-disk cache: keyed by the fully-formatted request
-        # (model, wire messages, schema and final kwargs), so any change to
-        # prompts, tools or generation parameters yields a different entry.
-        # The `stream` flag is excluded from the key: a streamed call stores
-        # the same assistant ChatMessage a non-streamed schema-less call does
-        # (streaming forces schema=None), so both share one entry; a hit is
-        # replayed as a single-chunk stream when `streaming=True`.
-        cache_key = None
-        if self._file_cache is not None:
-            cache_key = self._file_cache.make_key(
-                {
-                    "model": self.model,
-                    "messages": formatted_messages,
-                    "schema": schema,
-                    "kwargs": {k: v for k, v in kwargs.items() if k != "stream"},
-                }
+        return _PreparedRequest(
+            formatted_messages, schema, schema_had_thinking, streaming, kwargs
+        )
+
+    async def build_request(
+        self, messages, schema=None, tools=None, tool_schemas=None, **kwargs
+    ):
+        """What a call with these arguments would send, without sending it.
+
+        Returns the arguments `call()` hands to litellm for the same
+        `messages`, `schema`, `tools`, `tool_schemas` and keyword arguments:
+        the model, the wire messages and every request parameter (the
+        structured-output payload, the tools, the reasoning level, the
+        provider routing). Transport settings (`timeout`, `caching`) are left
+        out. Nothing is sent and the file cache is not read; deferred media
+        references (a URL or a path) are left as given, not fetched. A
+        request is never streamed here.
+
+        ```python
+        import synalinks
+
+        lm = synalinks.LanguageModel(model="openrouter/deepseek/deepseek-v4-flash")
+        request = await lm.build_request(messages, schema=Answer.get_schema())
+        print(request["provider"])  # the routing OpenRouter would receive
+        ```
+
+        Args:
+            messages (ChatMessages | dict): The chat messages, as `call()`
+                takes them.
+            schema (dict): The target JSON schema (optional).
+            tools (list | dict): `synalinks.modules.Tool`s the LM may call
+                (optional). Mutually exclusive with `schema`.
+            tool_schemas (list): Tool declarations already in wire shape
+                (optional). Mutually exclusive with `schema`.
+            **kwargs (keyword arguments): The call's own keyword arguments.
+
+        Returns:
+            (dict): `model`, `messages` and the request parameters.
+        """
+        if schema and (tools or tool_schemas):
+            raise ValueError(
+                "`schema` and `tools` cannot be passed to the same LM call: "
+                "schema forces structured output, while tools let the LM choose "
+                "which to call."
             )
-            if cache_key is not None:
-                cached_json = self._file_cache.get(cache_key)
-                if cached_json is not None:
-                    self._record_event("cache_hits")
-                    _CURRENT_CALL_USAGE.set({"cache_hit": True})
-                    if streaming:
-                        return StreamingIterator(_cached_message_to_chunks(cached_json))
-                    return JsonDataModel(
-                        json=cached_json,
-                        schema=schema if schema else ChatMessage.get_schema(),
-                        name=f"{self.name}_response",
-                    )
-        try:
-            response = await self._call_with_retry(
-                formatted_messages,
-                schema,
-                streaming,
-                schema_had_thinking,
-                **kwargs,
-            )
-            if cache_key is not None and response is not None:
-                if streaming:
-                    # Cache once the caller drains the stream; an abandoned
-                    # stream is incomplete and is not cached.
-                    file_cache = self._file_cache
-                    response._on_complete = lambda json_instance: file_cache.set(
-                        cache_key, json_instance
-                    )
-                else:
-                    self._file_cache.set(cache_key, response.get_json())
-            return response
-        except Exception as e:
-            warnings.warn(f"All retries failed for {self}: {e}")
-            self._record_event("failed_calls")
-            if self.fallback:
-                self._record_event("fallback_activations")
-                response = await self.fallback(
-                    messages,
-                    schema=schema,
-                    tools=tools,
-                    tool_schemas=tool_schemas,
-                    streaming=streaming,
-                    **input_kwargs,
-                )
-                # The fallback's usage is reported on its own span: this call
-                # only reports its failure.
-                _CURRENT_CALL_USAGE.set({"error": str(e), "fallback": True})
-                return response
-            else:
-                _CURRENT_CALL_USAGE.set({"error": str(e)})
-                return None
+        prepared = await self._prepare_request(
+            messages,
+            schema,
+            tools,
+            tool_schemas,
+            False,
+            kwargs,
+            resolve_media=False,
+        )
+        return {
+            "model": self.model,
+            "messages": prepared.messages,
+            **prepared.kwargs,
+        }
 
     async def _acompletion(self, formatted_messages, **kwargs):
         """Send one completion request and return the provider response.

@@ -1,6 +1,7 @@
 # License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
 import base64
+import copy
 import json
 import os
 import threading
@@ -2012,3 +2013,145 @@ class ProviderPrefixRewriteTest(testing.TestCase):
 
         self.assertEqual(vllm.model, "hosted_vllm/RedHatAI/Qwen3-8B-vllm-FP8")
         self.assertEqual(ollama.model, "ollama_chat/me/ollama-tuned")
+
+
+class _BuiltAnswer(DataModel):
+    answer: str
+
+
+_LOOKUP_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "lookup",
+        "description": "Look a word up.",
+        "parameters": {
+            "type": "object",
+            "properties": {"word": {"type": "string"}},
+            "required": ["word"],
+        },
+    },
+}
+
+
+def _question():
+    return ChatMessages(messages=[ChatMessage(role=ChatRole.USER, content="Pick one.")])
+
+
+def _sent(mock_completion):
+    """What `call()` handed to litellm, without the transport settings."""
+    kwargs = dict(mock_completion.call_args.kwargs)
+    kwargs.pop("timeout")
+    kwargs.pop("caching")
+    return kwargs
+
+
+class BuildRequestTest(testing.TestCase):
+    """`build_request` returns what a call would send, without sending it."""
+
+    @patch("litellm.acompletion")
+    async def test_build_request_is_what_call_sends_for_an_openrouter_structured_call(
+        self, mock_completion
+    ):
+        mock_completion.return_value = {
+            "choices": [{"message": {"content": '{"answer": "B"}'}}]
+        }
+        lm = LanguageModel(model="openrouter/acme/plain-1")
+        schema = _BuiltAnswer.get_schema()
+        built = await lm.build_request(_question(), schema=schema)
+        await lm(_question(), schema=schema)
+        self.assertEqual(built, _sent(mock_completion))
+        self.assertEqual(
+            built["provider"],
+            {"require_parameters": True, "ignore": ["coreweave", "nebius"]},
+        )
+        self.assertTrue(built["response_format"]["json_schema"]["strict"])
+
+    @patch("litellm.acompletion")
+    async def test_build_request_is_what_call_sends_for_an_openrouter_tool_call(
+        self, mock_completion
+    ):
+        mock_completion.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        lm = LanguageModel(model="openrouter/acme/plain-1")
+        built = await lm.build_request(_question(), tool_schemas=[_LOOKUP_TOOL])
+        await lm(_question(), tool_schemas=[_LOOKUP_TOOL])
+        self.assertEqual(built, _sent(mock_completion))
+        self.assertIn("tools", built)
+        self.assertNotIn("response_format", built)
+        self.assertNotIn("ignore", built.get("provider") or {})
+
+    @patch("litellm.acompletion")
+    async def test_build_request_forwards_a_level_only_to_a_model_declared_as_reasoning(
+        self, mock_completion
+    ):
+        mock_completion.return_value = {
+            "choices": [{"message": {"content": '{"answer": "B"}'}}]
+        }
+        schema = _BuiltAnswer.get_schema()
+        thinker = LanguageModel(
+            model="openrouter/acme/thinker-1", supports_reasoning=True
+        )
+        built = await thinker.build_request(
+            _question(), schema=schema, reasoning_effort="high"
+        )
+        await thinker(_question(), schema=schema, reasoning_effort="high")
+        self.assertEqual(built, _sent(mock_completion))
+        self.assertEqual(built["reasoning_effort"], "high")
+        plain = LanguageModel(model="openrouter/acme/plain-1")
+        built = await plain.build_request(
+            _question(), schema=schema, reasoning_effort="high"
+        )
+        self.assertNotIn("reasoning_effort", built)
+
+    @patch("litellm.acompletion")
+    async def test_build_request_keeps_another_providers_own_shape(self, mock_completion):
+        mock_completion.return_value = {
+            "choices": [{"message": {"content": '{"answer": "B"}'}}]
+        }
+        lm = LanguageModel(model="openai/gpt-4o-mini")
+        schema = _BuiltAnswer.get_schema()
+        built = await lm.build_request(_question(), schema=schema)
+        await lm(_question(), schema=schema)
+        self.assertEqual(built, _sent(mock_completion))
+        self.assertNotIn("provider", built)
+
+    async def test_build_request_neither_fetches_media_nor_changes_its_inputs(self):
+        lm = LanguageModel(model="openrouter/acme/plain-1", provider={"order": ["acme"]})
+        defaults = copy.deepcopy(lm.default_kwargs)
+        per_call = {"temperature": 0.0}
+        sent_per_call = copy.deepcopy(per_call)
+        messages = ChatMessages.model_validate_json(
+            '{"messages":[{"role":"user","content":['
+            '{"type":"text","text":"caption"},'
+            '{"type":"image_url","image_url":{"url":"https://example.invalid/x.png"}}]}]}'
+        )
+        lm.last_call_finish_reason = "stop"
+        with patch(
+            "synalinks.src.modules.language_models.language_model.resolve_content_media",
+            side_effect=AssertionError("build_request fetched media"),
+        ):
+            built = await lm.build_request(
+                messages, schema=_BuiltAnswer.get_schema(), **per_call
+            )
+        part = built["messages"][0]["content"][1]
+        self.assertEqual(part["image_url"]["url"], "https://example.invalid/x.png")
+        self.assertEqual(lm.default_kwargs, defaults)
+        self.assertEqual(per_call, sent_per_call)
+        self.assertNotIn("stream", built)
+        self.assertEqual(lm.last_call_finish_reason, "stop")
+
+    async def test_build_request_refuses_a_schema_with_tools(self):
+        lm = LanguageModel(model="openrouter/acme/plain-1")
+        with self.assertRaises(ValueError):
+            await lm.build_request(
+                _question(),
+                schema=_BuiltAnswer.get_schema(),
+                tool_schemas=[_LOOKUP_TOOL],
+            )
+
+    async def test_build_request_works_on_an_oauth_language_model(self):
+        from synalinks.src.modules.language_models import OAuthLanguageModel
+
+        lm = OAuthLanguageModel(model="codex/gpt-6.1-sol")
+        built = await lm.build_request(_question())
+        self.assertEqual(built["model"], "codex/gpt-6.1-sol")
+        self.assertEqual(built["messages"][0]["content"], "Pick one.")
