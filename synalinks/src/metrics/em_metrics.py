@@ -14,9 +14,8 @@ Class hierarchy:
 """
 
 from synalinks.src.api_export import synalinks_export
-from synalinks.src.backend.common.op_scope import read_phase_wall_clock_s
-from synalinks.src.metrics.metric import Metric
-from synalinks.src.metrics.metrics_utils import model_holders
+from synalinks.src.metrics.metrics_utils import ModelOperationalMetric
+from synalinks.src.metrics.metrics_utils import embedding_models
 
 _TRACKED_SUFFIXES = (
     "calls",
@@ -31,31 +30,6 @@ _TRACKED_SUFFIXES = (
 )
 
 
-def _collect_embedding_models(program):
-    """Walk a program's module tree and return every unique EmbeddingModel
-    (including those reached via the `fallback` chain), preserving order.
-    """
-    from synalinks.src.modules.embedding_models import EmbeddingModel
-
-    ems = []
-    seen = set()
-
-    def _add_chain(em):
-        while em is not None and id(em) not in seen:
-            if isinstance(em, EmbeddingModel):
-                seen.add(id(em))
-                ems.append(em)
-                em = getattr(em, "fallback", None)
-            else:
-                break
-
-    for module in model_holders(program):
-        _add_chain(getattr(module, "embedding_model", None))
-        if isinstance(module, EmbeddingModel):
-            _add_chain(module)
-    return ems
-
-
 # ---------------------------------------------------------------------------
 # Inference-phase base + metrics
 # ---------------------------------------------------------------------------
@@ -67,7 +41,7 @@ def _collect_embedding_models(program):
         "synalinks.EmbeddingModelOperationalMetric",
     ]
 )
-class EmbeddingModelOperationalMetric(Metric):
+class EmbeddingModelOperationalMetric(ModelOperationalMetric):
     """Base class for `EmbeddingModel` runtime-counter metrics.
 
     Subclasses set `_phase` to one of ``"inference"``, ``"reward"``, or
@@ -78,71 +52,23 @@ class EmbeddingModelOperationalMetric(Metric):
     Binds itself automatically to every `EmbeddingModel` reachable from
     the program (and their `.fallback` chains) on `program.compile()`.
 
-    Example:
+    Example (with a concrete subclass):
 
     ```python
     program.compile(
         metrics=[
-            synalinks.metrics.EmbeddingModelOperationalMetric(),
+            synalinks.metrics.EmbeddingTokens(),
         ],
     )
     ```
     """
 
-    _phase = "inference"
-
-    def __init__(self, name=None):
-        super().__init__(name=name)
-        self._embedding_models = []
-        self._baselines = {suffix: 0 for suffix in _TRACKED_SUFFIXES}
-        self._wall_baseline = 0.0
-        # The bound program's own phase clock (thread default when unbound).
-        self._phase_clock = None
+    _collect = staticmethod(embedding_models)
+    _tracked_suffixes = _TRACKED_SUFFIXES
 
     @property
     def embedding_models(self):
-        return list(self._embedding_models)
-
-    def bind_program(self, program):
-        self._embedding_models = _collect_embedding_models(program)
-        self._phase_clock = getattr(program, "_phase_clock", None)
-        self._snapshot()
-
-    def _attr(self, suffix):
-        return f"{self._phase}_cumulated_{suffix}"
-
-    def _read(self, suffix):
-        attr = self._attr(suffix)
-        return sum(getattr(em, attr, 0) for em in self._embedding_models)
-
-    def _snapshot(self):
-        for suffix in _TRACKED_SUFFIXES:
-            self._baselines[suffix] = self._read(suffix)
-        self._wall_baseline = read_phase_wall_clock_s(self._phase, self._phase_clock)
-
-    def _delta(self, suffix):
-        return self._read(suffix) - self._baselines.get(suffix, 0)
-
-    def _wall_clock_delta(self):
-        """Wall-clock seconds the trainer spent in this metric's phase since
-        the last snapshot: the throughput denominator (concurrency-safe,
-        unlike summed `elapsed_s`).
-        """
-        return (
-            read_phase_wall_clock_s(self._phase, self._phase_clock) - self._wall_baseline
-        )
-
-    def reset_state(self):
-        self._snapshot()
-
-    async def update_state(self, *args, **kwargs):
-        return
-
-    def result(self):
-        raise NotImplementedError
-
-    def get_config(self):
-        return {"name": self.name}
+        return list(self._models)
 
 
 @synalinks_export("synalinks.metrics.EmbeddingTokens")
@@ -226,6 +152,8 @@ class EmbeddingThroughput(EmbeddingModelOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="embedding_throughput"):
         super().__init__(name=name)
 
@@ -282,6 +210,8 @@ class EmbeddingTokensPerSecond(EmbeddingModelOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="embedding_tokens_per_second"):
         super().__init__(name=name)
 
@@ -306,6 +236,8 @@ class EmbeddingVectorsPerSecond(EmbeddingModelOperationalMetric):
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="embedding_vectors_per_second"):
         super().__init__(name=name)
@@ -407,6 +339,8 @@ class AvgEmbeddingCachedTokensPerCall(EmbeddingModelOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="avg_embedding_cached_tokens_per_call"):
         super().__init__(name=name)
 
@@ -432,6 +366,8 @@ class EmbeddingCachedTokens(EmbeddingModelOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="embedding_cached_tokens"):
         super().__init__(name=name)
 
@@ -453,6 +389,8 @@ class EmbeddingCacheHitRate(EmbeddingModelOperationalMetric):
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="embedding_cache_hit_rate"):
         super().__init__(name=name)
@@ -643,6 +581,8 @@ class RewardEmbeddingThroughput(EmbeddingModelRewardsOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="reward_embedding_throughput"):
         super().__init__(name=name)
 
@@ -693,6 +633,8 @@ class RewardEmbeddingTokensPerSecond(EmbeddingModelRewardsOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="reward_embedding_tokens_per_second"):
         super().__init__(name=name)
 
@@ -717,6 +659,8 @@ class RewardEmbeddingVectorsPerSecond(EmbeddingModelRewardsOperationalMetric):
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="reward_embedding_vectors_per_second"):
         super().__init__(name=name)
@@ -818,6 +762,8 @@ class AvgRewardEmbeddingCachedTokensPerCall(EmbeddingModelRewardsOperationalMetr
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="avg_reward_embedding_cached_tokens_per_call"):
         super().__init__(name=name)
 
@@ -843,6 +789,8 @@ class RewardEmbeddingCachedTokens(EmbeddingModelRewardsOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="reward_embedding_cached_tokens"):
         super().__init__(name=name)
 
@@ -864,6 +812,8 @@ class RewardEmbeddingCacheHitRate(EmbeddingModelRewardsOperationalMetric):
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="reward_embedding_cache_hit_rate"):
         super().__init__(name=name)
@@ -1054,6 +1004,8 @@ class OptimizerEmbeddingThroughput(EmbeddingModelOptimizersOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="optimizer_embedding_throughput"):
         super().__init__(name=name)
 
@@ -1104,6 +1056,8 @@ class OptimizerEmbeddingTokensPerSecond(EmbeddingModelOptimizersOperationalMetri
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="optimizer_embedding_tokens_per_second"):
         super().__init__(name=name)
 
@@ -1128,6 +1082,8 @@ class OptimizerEmbeddingVectorsPerSecond(EmbeddingModelOptimizersOperationalMetr
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="optimizer_embedding_vectors_per_second"):
         super().__init__(name=name)
@@ -1229,6 +1185,8 @@ class AvgOptimizerEmbeddingCachedTokensPerCall(EmbeddingModelOptimizersOperation
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="avg_optimizer_embedding_cached_tokens_per_call"):
         super().__init__(name=name)
 
@@ -1254,6 +1212,8 @@ class OptimizerEmbeddingCachedTokens(EmbeddingModelOptimizersOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="optimizer_embedding_cached_tokens"):
         super().__init__(name=name)
 
@@ -1275,6 +1235,8 @@ class OptimizerEmbeddingCacheHitRate(EmbeddingModelOptimizersOperationalMetric):
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="optimizer_embedding_cache_hit_rate"):
         super().__init__(name=name)

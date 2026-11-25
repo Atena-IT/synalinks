@@ -156,9 +156,17 @@ You can also install the library in a new project with:
 uv add synalinks
 ```
 
-To transform your coding agent into an AI engineer, do this at the root of your project:
+To transform your coding agent into an AI engineer, install the Synalinks skill:
 
 ```shell
+# Claude Code (in a session)
+/plugin install synalinks --marketplace SynaLinks/synalinks-skills
+# Codex
+codex plugin marketplace add SynaLinks/synalinks-skills
+codex plugin add synalinks@synalinks-skills
+# OpenCode
+opencode plugin github:SynaLinks/synalinks-skills
+# Any other agent (Cursor, Gemini CLI, Copilot, ...), at the root of your project
 npx skills add SynaLinks/synalinks-skills --skill synalinks
 ```
 
@@ -268,7 +276,7 @@ Synalinks provides Python operators for combining and manipulating data models, 
 | `&` | Logical And | Safe concatenation that returns `None` if either input is `None`. | Combining with potentially null branch outputs |
 | `\|` | Logical Or | Returns the non-`None` data model. If both are non-`None`, merges them. | Gathering outputs from conditional branches |
 | `^` | Logical Xor | Returns data if exactly one input is non-`None`, otherwise `None`. | Exclusive branch selection |
-| `~` | Logical Not | Returns `None` if input is non-`None`, or a empty data model if `None`. | Inverting branch conditions |
+| `~` | Logical Not | Always returns `None` (cancels a path); symbolically keeps the input schema. | Inverting branch conditions |
 | `in` | Contains | Checks if a string key exists in the schema properties, or if another data model's schema is contained. Returns `True` or `False`. | Conditional field checking, schema validation |
 
 </div>

@@ -186,7 +186,7 @@ class SelfCritique(Module):
     Example:
 
     ```python
-    import synalink
+    import synalinks
     import asyncio
 
     class Query(synalinks.DataModel):
@@ -247,7 +247,7 @@ class SelfCritique(Module):
         reasoning_effort (string): Optional. The reasoning effort for the LM call
             between ['minimal', 'low', 'medium', 'high', 'xhigh', 'disable',
             'none', None].
-            Default to None (no reasoning).
+            Default to None (the provider default).
         use_inputs_schema (bool): Optional. Whether or not use the inputs schema in
             the prompt (Default to False) (see `Generator`).
         use_outputs_schema (bool): Optional. Whether or not use the outputs schema in
@@ -363,15 +363,8 @@ class SelfCritique(Module):
         outputs = await self.generator(inputs, training=training)
         if outputs is None or not self.return_reward:
             return outputs
-        return self._normalize_reward(outputs)
-
-    def _normalize_reward(self, outputs):
-        """Rewrite `reward` from the native `score_type` scale to a 0..1 float.
-
-        The underlying generator keeps working in the native scale (so its
-        schema, prompt and recorded training predictions stay consistent);
-        only the module's output is normalized.
-        """
+        # `reward` moves from the native `score_type` scale to a 0..1 float; the
+        # generator keeps the native scale (schema, prompt, recorded predictions).
         schema = _normalized_reward_schema(outputs.get_schema())
         if is_symbolic_data_model(outputs):
             return SymbolicDataModel(schema=schema, name=outputs.name)

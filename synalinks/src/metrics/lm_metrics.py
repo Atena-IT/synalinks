@@ -20,9 +20,8 @@ Class hierarchy:
 """
 
 from synalinks.src.api_export import synalinks_export
-from synalinks.src.backend.common.op_scope import read_phase_wall_clock_s
-from synalinks.src.metrics.metric import Metric
-from synalinks.src.metrics.metrics_utils import model_holders
+from synalinks.src.metrics.metrics_utils import ModelOperationalMetric
+from synalinks.src.metrics.metrics_utils import language_models
 
 _TRACKED_SUFFIXES = (
     "calls",
@@ -44,48 +43,6 @@ _TRACKED_SUFFIXES = (
 )
 
 
-def _collect_language_models(program):
-    """Walk a program's module tree and return every unique LanguageModel
-    (including those reached via the `fallback` chain), preserving order.
-
-    Checks both `language_model` and `sub_language_model`: agents such as
-    `RecursiveLanguageModelAgent` and `DeepAgent` resolve `sub_language_model`
-    to its own `LanguageModel` instance (distinct from `language_model`, even
-    when constructed from the same model identifier — see
-    `RecursiveLanguageModelAgent.__init__`) to drive recursive sub-queries /
-    subagents. Skipping it here left those calls' `cumulated_cost` counted
-    (updated unconditionally) but every token/latency operational metric
-    blind to them, since only `language_model` was ever chained.
-
-    A `DecisionModel` has the same interface and keeps the same counters, so it
-    is collected too: every operational metric counts its calls. The models of
-    the compiled reward (e.g. a judge's) are collected as well, since they run
-    during the reward phase.
-    """
-    from synalinks.src.modules.decision_models import DecisionModel
-    from synalinks.src.modules.language_models import LanguageModel
-
-    lms = []
-    seen = set()
-
-    def _add_chain(lm):
-        while lm is not None and id(lm) not in seen:
-            if isinstance(lm, (LanguageModel, DecisionModel)):
-                seen.add(id(lm))
-                lms.append(lm)
-                lm = getattr(lm, "fallback", None)
-            else:
-                break
-
-    for module in model_holders(program):
-        _add_chain(getattr(module, "language_model", None))
-        _add_chain(getattr(module, "sub_language_model", None))
-        _add_chain(getattr(module, "decision_model", None))
-        if isinstance(module, (LanguageModel, DecisionModel)):
-            _add_chain(module)
-    return lms
-
-
 # ---------------------------------------------------------------------------
 # Inference-phase base + metrics
 # ---------------------------------------------------------------------------
@@ -97,7 +54,7 @@ def _collect_language_models(program):
         "synalinks.LMOperationalMetric",
     ]
 )
-class LMOperationalMetric(Metric):
+class LMOperationalMetric(ModelOperationalMetric):
     """Base class for `LanguageModel` runtime-counter metrics.
 
     Subclasses set `_phase` to one of ``"inference"``, ``"reward"``, or
@@ -109,71 +66,23 @@ class LMOperationalMetric(Metric):
     reachable from the program (and their `.fallback` chains) when
     `program.compile()` is called, and counters are summed across all.
 
-    Example:
+    Example (with a concrete subclass):
 
     ```python
     program.compile(
         metrics=[
-            synalinks.metrics.LMOperationalMetric(),
+            synalinks.metrics.InputTokens(),
         ],
     )
     ```
     """
 
-    _phase = "inference"
-
-    def __init__(self, name=None):
-        super().__init__(name=name)
-        self._language_models = []
-        self._baselines = {suffix: 0 for suffix in _TRACKED_SUFFIXES}
-        self._wall_baseline = 0.0
-        # The bound program's own phase clock (thread default when unbound).
-        self._phase_clock = None
+    _collect = staticmethod(language_models)
+    _tracked_suffixes = _TRACKED_SUFFIXES
 
     @property
     def language_models(self):
-        return list(self._language_models)
-
-    def bind_program(self, program):
-        self._language_models = _collect_language_models(program)
-        self._phase_clock = getattr(program, "_phase_clock", None)
-        self._snapshot()
-
-    def _attr(self, suffix):
-        return f"{self._phase}_cumulated_{suffix}"
-
-    def _read(self, suffix):
-        attr = self._attr(suffix)
-        return sum(getattr(lm, attr, 0) for lm in self._language_models)
-
-    def _snapshot(self):
-        for suffix in _TRACKED_SUFFIXES:
-            self._baselines[suffix] = self._read(suffix)
-        self._wall_baseline = read_phase_wall_clock_s(self._phase, self._phase_clock)
-
-    def _delta(self, suffix):
-        return self._read(suffix) - self._baselines.get(suffix, 0)
-
-    def _wall_clock_delta(self):
-        """Wall-clock seconds the trainer spent in this metric's phase since
-        the last snapshot. Used as the throughput denominator so concurrent
-        (overlapping) calls don't inflate it the way summed `elapsed_s` does.
-        """
-        return (
-            read_phase_wall_clock_s(self._phase, self._phase_clock) - self._wall_baseline
-        )
-
-    def reset_state(self):
-        self._snapshot()
-
-    async def update_state(self, *args, **kwargs):
-        return
-
-    def result(self):
-        raise NotImplementedError
-
-    def get_config(self):
-        return {"name": self.name}
+        return list(self._models)
 
 
 @synalinks_export("synalinks.metrics.InputTokens")
@@ -332,6 +241,8 @@ class AvgCachedTokensPerCall(LMOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="avg_cached_tokens_per_call"):
         super().__init__(name=name)
 
@@ -407,6 +318,8 @@ class TokensPerSecond(LMOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="tokens_per_second"):
         super().__init__(name=name)
 
@@ -434,6 +347,8 @@ class Throughput(LMOperationalMetric):
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="throughput"):
         super().__init__(name=name)
@@ -542,6 +457,8 @@ class CachedTokens(LMOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="cached_tokens"):
         super().__init__(name=name)
 
@@ -589,6 +506,8 @@ class CacheHitRate(LMOperationalMetric):
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="cache_hit_rate"):
         super().__init__(name=name)
@@ -1011,6 +930,8 @@ class AvgRewardCachedTokensPerCall(LMRewardsOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="avg_reward_cached_tokens_per_call"):
         super().__init__(name=name)
 
@@ -1086,6 +1007,8 @@ class RewardTokensPerSecond(LMRewardsOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="reward_tokens_per_second"):
         super().__init__(name=name)
 
@@ -1109,6 +1032,8 @@ class RewardThroughput(LMRewardsOperationalMetric):
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="reward_throughput"):
         super().__init__(name=name)
@@ -1207,6 +1132,8 @@ class RewardCachedTokens(LMRewardsOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="reward_cached_tokens"):
         super().__init__(name=name)
 
@@ -1250,6 +1177,8 @@ class RewardCacheHitRate(LMRewardsOperationalMetric):
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="reward_cache_hit_rate"):
         super().__init__(name=name)
@@ -1567,6 +1496,8 @@ class AvgOptimizerCachedTokensPerCall(LMOptimizersOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="avg_optimizer_cached_tokens_per_call"):
         super().__init__(name=name)
 
@@ -1642,6 +1573,8 @@ class OptimizerTokensPerSecond(LMOptimizersOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="optimizer_tokens_per_second"):
         super().__init__(name=name)
 
@@ -1665,6 +1598,8 @@ class OptimizerThroughput(LMOptimizersOperationalMetric):
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="optimizer_throughput"):
         super().__init__(name=name)
@@ -1763,6 +1698,8 @@ class OptimizerCachedTokens(LMOptimizersOperationalMetric):
     ```
     """
 
+    direction = "up"
+
     def __init__(self, name="optimizer_cached_tokens"):
         super().__init__(name=name)
 
@@ -1806,6 +1743,8 @@ class OptimizerCacheHitRate(LMOptimizersOperationalMetric):
     )
     ```
     """
+
+    direction = "up"
 
     def __init__(self, name="optimizer_cache_hit_rate"):
         super().__init__(name=name)

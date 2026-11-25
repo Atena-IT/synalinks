@@ -63,7 +63,10 @@ OPENROUTER_IGNORED_PROVIDERS = (
     "nebius",
 )
 
-# Providers sent their own off switch for `reasoning_effort="disable"`.
+# The portable reasoning levels, lowest first ("none" turns reasoning off).
+REASONING_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+# Providers sent their own off switch for `reasoning_effort="none"`.
 DISABLES_REASONING = (
     "anthropic",
     "azure",
@@ -144,47 +147,6 @@ _CACHE_CREATION_TTL_KEYS = (
 )
 
 
-def _extract_lm_extras(usage, response):
-    """Pull tier-1 counters + long-tail details from a LiteLLM ModelResponse.
-
-    Returns ``(cached_tokens, cache_creation_tokens, reasoning_tokens, extras)``
-    where ``extras`` is a dict of long-tail key -> incremental count.
-    """
-    prompt_details = _safe_get(usage, "prompt_tokens_details")
-    completion_details = _safe_get(usage, "completion_tokens_details")
-    server_tool = _safe_get(usage, "server_tool_use")
-    hidden = getattr(response, "_hidden_params", None) or {}
-
-    cached = _to_int(_safe_get(prompt_details, "cached_tokens"))
-    cache_creation = _to_int(_safe_get(prompt_details, "cache_creation_tokens"))
-    reasoning = _to_int(_safe_get(completion_details, "reasoning_tokens"))
-
-    extras = {}
-    for key in _PROMPT_DETAIL_KEYS:
-        v = _safe_get(prompt_details, key)
-        if v:
-            extras[f"prompt_{key}"] = v
-    cache_create_ttl = _safe_get(prompt_details, "cache_creation_token_details")
-    for key in _CACHE_CREATION_TTL_KEYS:
-        v = _safe_get(cache_create_ttl, key)
-        if v:
-            extras[f"cache_creation_{key}"] = v
-    for key in _COMPLETION_DETAIL_KEYS:
-        v = _safe_get(completion_details, key)
-        if v:
-            extras[f"completion_{key}"] = v
-    for key in _SERVER_TOOL_KEYS:
-        v = _safe_get(server_tool, key)
-        if v:
-            extras[f"server_{key}"] = v
-    overhead = (
-        hidden.get("litellm_overhead_time_ms") if isinstance(hidden, dict) else None
-    )
-    if overhead is not None:
-        extras["litellm_overhead_time_ms"] = overhead
-    return cached, cache_creation, reasoning, extras
-
-
 # Usage of the LM call running in the current task, read by hooks (the MLflow
 # `Monitor` hook writes it as span attributes). A ContextVar rather than an
 # instance attribute so concurrent calls on one LM never see each other's.
@@ -228,9 +190,9 @@ def _message_to_wire(message):
 
     Delegates to `to_chat_completion_message`, the single source of truth
     for the synalinks<->OpenAI mapping (tool-call envelopes with their
-    JSON-encoded `arguments`, dict content JSON-encoded on tool results,
-    and `thinking`/`thinking_blocks` mapped onto `reasoning_content`/
-    `thinking_blocks` for DeepSeek- and Anthropic-style providers). Unset
+    JSON-encoded `arguments`, and `thinking`/`thinking_blocks` mapped onto
+    `reasoning_content`/`thinking_blocks` for DeepSeek- and Anthropic-style
+    providers). Unset
     fields are dropped, but `content` is always emitted (as null when
     empty) since some providers expect the key to be present.
     """
@@ -345,9 +307,8 @@ class LanguageModel(Module):
     structures in language. Language models can perform various tasks such as text
     generation, translation, summarization, and answering questions.
 
-    We support providers that implement *constrained structured output*
-    like Azure, Ollama or Mistral. In addition we support providers that otherwise
-    allow to constrain the use of a specific tool like Groq or Anthropic.
+    Every supported provider uses its native *constrained structured output*
+    (`response_format`), e.g. OpenAI, Azure, Ollama, Mistral, Groq or Anthropic.
 
     For the complete list of models, please refer to the providers documentation.
     The provider prefixes accepted in `model` (the part before the `/`) are
@@ -683,10 +644,9 @@ class LanguageModel(Module):
     parameter, passed either as a default in the constructor or per call. It
     accepts:
 
-    - `"none"` (the default): send nothing, leaving the model at its provider
+    - `None` (the default): send nothing, leaving the model at its provider
       default reasoning behavior.
-    - `"disable"`: actively turn native reasoning *off*, for a model that
-      reasons by default. Each provider gets its own switch:
+    - `"none"`: turn native reasoning *off*. Each provider gets its own switch:
 
       - Ollama: `think=False` (ignored by non-thinking models).
       - vLLM/SGLang (`vllm/`, `sglang/`, `mirai/`): the chat template's
@@ -702,15 +662,23 @@ class LanguageModel(Module):
 
       Sent only when the model reasons natively (see `supports_reasoning()`;
       Cohere's by their name). A model that cannot stop reasoning gets its
-      lowest effort instead (`"none"` would be refused): xAI's Grok and the
-      always-thinking Claude models (`"low"`), the OpenAI models without
-      `"none"` (`"minimal"`, else `"low"`), Mistral Large 4 and GLM 5 (`"low"`),
-      Groq's models other than Qwen (`"low"`), Gemini 2.5 Pro (its smallest
-      thinking budget, 128 tokens), and the ChatGPT backend (`codex/`).
-    - any other value (e.g. `"low"`, `"medium"`, `"high"`): forwarded to the
-      provider as the reasoning effort, but only when the model reasons
-      natively (otherwise it is dropped; see `supports_reasoning()`). The
-      native trace then fills a `thinking` field instead of the model.
+      lowest effort instead: xAI's Grok and the always-thinking Claude models
+      (`"low"`), the OpenAI models without `"none"` (`"minimal"`, else
+      `"low"`), Mistral Large 4 and GLM 5 (`"low"`), Groq's models other than
+      Qwen (`"low"`), Gemini 2.5 Pro (its smallest thinking budget, 128
+      tokens), and the ChatGPT backend (`codex/`). `"disable"` is a
+      deprecated alias of `"none"`.
+    - a level, from lowest to highest `"minimal"`, `"low"`, `"medium"`,
+      `"high"`, `"xhigh"`, `"max"`: forwarded to the provider as the
+      reasoning effort, but only when the model reasons natively (otherwise
+      it is dropped; see `supports_reasoning()`). A level the model does not
+      list (in litellm's model table) is rounded down to the nearest level it
+      does (up when there is none below), with a warning; a model missing
+      from the table gets the level unchanged. The native trace then fills a
+      `thinking` field instead of the model.
+
+    A provider-specific setting passed explicitly (e.g. `thinking={...}` or
+    `extra_body`) is sent as is and wins over `reasoning_effort`.
 
     ```python
     import synalinks
@@ -718,6 +686,7 @@ class LanguageModel(Module):
     language_model = synalinks.LanguageModel(
         model="openai/o3-mini",
         reasoning_effort="medium",
+        supports_reasoning=True,
     )
     ```
 
@@ -725,7 +694,8 @@ class LanguageModel(Module):
         model (str): The model to use.
         api_base (str): Optional. The endpoint to use.
         timeout (int): Optional. The timeout value in seconds (Default to 600).
-        retry (int): Optional. The number of retry (default to 5).
+        retry (int): Optional. The maximum number of attempts, the first
+            one included (default to 5).
         retry_max_wait (int): Optional. Max seconds to wait between retries when a
             rate-limit `Retry-After` header is honored (default to 60).
         fallback (LanguageModel): Optional. The language model to fallback
@@ -755,7 +725,9 @@ class LanguageModel(Module):
             `temperature`, `top_p`, `top_k`, `max_tokens`, `reasoning_effort`)
             forwarded to every call. Per-call kwargs override these. See
             "Controlling reasoning effort" above for the `reasoning_effort`
-            values and their semantics.
+            values and their semantics. Credentials (`api_key`, `*_token`,
+            `*_secret_*`, `extra_headers`...) are never serialized by
+            `get_config`: set them again on load, or use environment variables.
     """
 
     def __init__(
@@ -827,7 +799,7 @@ class LanguageModel(Module):
             self.api_base = api_base
         if self.model.startswith("hosted_vllm") and not api_base:
             self.api_base = os.environ.get(
-                "HOSTED_VLLM_API_BASE", "http://localhost:8000"
+                "HOSTED_VLLM_API_BASE", "http://localhost:8000/v1"
             )
         self.timeout = timeout
         self.retry = retry
@@ -1036,13 +1008,26 @@ class LanguageModel(Module):
             kwargs["tools"] = wire_tools
 
         # The `reasoning_effort` values are documented in the class docstring.
-        reasoning_effort = kwargs.pop("reasoning_effort", "none")
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
+        if reasoning_effort == "disable":
+            warnings.warn(
+                '`reasoning_effort="disable"` is deprecated, use "none".',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            reasoning_effort = "none"
         schema_had_thinking = bool(schema) and "thinking" in (
             schema.get("properties") or {}
         )
         enable_thinking = None
         prefix = self.model.split("/", 1)[0]
-        if reasoning_effort == "disable":
+        row = (
+            litellm.model_cost.get(self.model)
+            or litellm.model_cost.get(self.model.split("/", 1)[-1])
+            or {}
+        )
+        levels = row.get("reasoning_effort_levels") or []
+        if reasoning_effort == "none":
             if prefix in ("ollama", "ollama_chat"):
                 kwargs["think"] = False
             elif prefix == "codex":
@@ -1057,12 +1042,6 @@ class LanguageModel(Module):
                 and not (prefix == "openai" and self.api_base)
                 and await self.supports_reasoning()
             ):
-                row = (
-                    litellm.model_cost.get(self.model)
-                    or litellm.model_cost.get(self.model.split("/", 1)[1])
-                    or {}
-                )
-                levels = row.get("reasoning_effort_levels") or []
                 claude = prefix == "anthropic" or (
                     prefix == "bedrock" and "claude" in self.model
                 )
@@ -1098,8 +1077,22 @@ class LanguageModel(Module):
                 else:
                     kwargs["reasoning_effort"] = levels[0] if levels else "low"
             enable_thinking = False
-        elif reasoning_effort != "none":
+        elif reasoning_effort is not None:
             if await self.supports_reasoning():
+                listed = [lv for lv in REASONING_LEVELS if lv in levels]
+                if (
+                    listed
+                    and reasoning_effort in REASONING_LEVELS
+                    and reasoning_effort not in listed
+                ):
+                    rank = REASONING_LEVELS.index(reasoning_effort)
+                    below = [lv for lv in listed if REASONING_LEVELS.index(lv) < rank]
+                    sent = below[-1] if below else listed[0]
+                    warnings.warn(
+                        f"{self.model} does not take reasoning_effort="
+                        f"{reasoning_effort!r}; sending {sent!r} instead."
+                    )
+                    reasoning_effort = sent
                 kwargs["reasoning_effort"] = reasoning_effort
                 enable_thinking = True
                 if schema_had_thinking and self._reasoning_trace:
@@ -1334,6 +1327,8 @@ class LanguageModel(Module):
                 response = await self.fallback(
                     messages,
                     schema=schema,
+                    tools=tools,
+                    tool_schemas=tool_schemas,
                     streaming=streaming,
                     **input_kwargs,
                 )
@@ -1406,9 +1401,42 @@ class LanguageModel(Module):
                     total_tokens = int(
                         usage.get("total_tokens") or (prompt_tokens + completion_tokens)
                     )
-                    cached, cache_creation, reasoning, extras = _extract_lm_extras(
-                        usage, response
+                    prompt_details = _safe_get(usage, "prompt_tokens_details")
+                    completion_details = _safe_get(usage, "completion_tokens_details")
+                    server_tool = _safe_get(usage, "server_tool_use")
+                    hidden = getattr(response, "_hidden_params", None) or {}
+                    cached = _to_int(_safe_get(prompt_details, "cached_tokens"))
+                    cache_creation = _to_int(
+                        _safe_get(prompt_details, "cache_creation_tokens")
                     )
+                    reasoning = _to_int(_safe_get(completion_details, "reasoning_tokens"))
+                    extras = {}
+                    for key in _PROMPT_DETAIL_KEYS:
+                        v = _safe_get(prompt_details, key)
+                        if v:
+                            extras[f"prompt_{key}"] = v
+                    cache_create_ttl = _safe_get(
+                        prompt_details, "cache_creation_token_details"
+                    )
+                    for key in _CACHE_CREATION_TTL_KEYS:
+                        v = _safe_get(cache_create_ttl, key)
+                        if v:
+                            extras[f"cache_creation_{key}"] = v
+                    for key in _COMPLETION_DETAIL_KEYS:
+                        v = _safe_get(completion_details, key)
+                        if v:
+                            extras[f"completion_{key}"] = v
+                    for key in _SERVER_TOOL_KEYS:
+                        v = _safe_get(server_tool, key)
+                        if v:
+                            extras[f"server_{key}"] = v
+                    overhead = (
+                        hidden.get("litellm_overhead_time_ms")
+                        if isinstance(hidden, dict)
+                        else None
+                    )
+                    if overhead is not None:
+                        extras["litellm_overhead_time_ms"] = overhead
                     self.last_call_prompt_tokens = prompt_tokens
                     self.last_call_completion_tokens = completion_tokens
                     self.last_call_tokens = total_tokens
@@ -1775,9 +1803,6 @@ class LanguageModel(Module):
         """
         return self.model.startswith("hosted_vllm")
 
-    def _obj_type(self):
-        return "LanguageModel"
-
     def get_config(self):
         config = {
             "model": self.model,
@@ -1792,7 +1817,11 @@ class LanguageModel(Module):
             "supports_audio": self._supports_audio,
             "name": self.name,
             "description": self.description,
-            **self.default_kwargs,
+            **{
+                k: v
+                for k, v in self.default_kwargs.items()
+                if not model_catalog.is_secret_kwarg(k)
+            },
         }
         if self.fallback:
             fallback_config = {

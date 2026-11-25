@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler
 from http.server import HTTPServer
 from unittest.mock import patch
 
+import litellm
 from litellm.types.utils import Choices
 from litellm.types.utils import CompletionTokensDetailsWrapper
 from litellm.types.utils import Message
@@ -26,6 +27,7 @@ from synalinks.src.backend import ChatRole
 from synalinks.src.backend import DataModel
 from synalinks.src.backend import Image
 from synalinks.src.backend.common.op_scope import _OP_SCOPE
+from synalinks.src.backend.pydantic.media import allow_media_root
 from synalinks.src.modules.core.tool import Tool
 from synalinks.src.modules.language_models import LanguageModel
 from synalinks.src.modules.language_models.language_model import _tool_to_wire
@@ -39,6 +41,7 @@ _SAMPLE_IMAGE = os.path.join(
     "guides",
     "traced_qa.png",
 )
+allow_media_root(os.path.dirname(_SAMPLE_IMAGE))
 
 
 class LanguageModelTest(testing.TestCase):
@@ -522,8 +525,8 @@ class LanguageModelTest(testing.TestCase):
     async def test_reasoning_effort_disable_sends_think_false_for_ollama(
         self, mock_completion
     ):
-        """`reasoning_effort="disable"` turns native thinking off on ollama
-        (which reasons by default) by sending `think=False`; `"none"` leaves the
+        """`reasoning_effort="none"` turns native thinking off on ollama
+        (which reasons by default) by sending `think=False`; `None` leaves the
         model at its default and sends nothing.
         """
         mock_completion.return_value = {"choices": [{"message": {"content": "ok"}}]}
@@ -532,15 +535,57 @@ class LanguageModelTest(testing.TestCase):
         )
 
         ollama_lm = LanguageModel(model="ollama_chat/qwen3:8b")
-        await ollama_lm(messages, reasoning_effort="disable")
+        await ollama_lm(messages, reasoning_effort="none")
         self.assertIs(mock_completion.call_args.kwargs.get("think"), False)
 
-        await ollama_lm(messages, reasoning_effort="none")
+        await ollama_lm(messages, reasoning_effort=None)
         self.assertNotIn("think", mock_completion.call_args.kwargs)
 
     @patch("litellm.acompletion")
-    async def test_reasoning_effort_disable_noop_for_non_ollama(self, mock_completion):
-        """Opt-in providers reason only when enabled, so "disable" sends no
+    async def test_reasoning_effort_none_values_differ(self, mock_completion):
+        mock_completion.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        messages = ChatMessages(
+            messages=[ChatMessage(role=ChatRole.USER, content="Hello")]
+        )
+        lm = LanguageModel(
+            model="vllm/Qwen/Qwen3-8B", api_base="http://h/v1", supports_reasoning=True
+        )
+        await lm(messages, reasoning_effort=None)
+        self.assertNotIn("reasoning_effort", mock_completion.call_args.kwargs)
+        self.assertNotIn("extra_body", mock_completion.call_args.kwargs)
+
+        await lm(messages, reasoning_effort="none")
+        kwargs = mock_completion.call_args.kwargs
+        self.assertNotIn("reasoning_effort", kwargs)
+        self.assertIs(
+            kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"], False
+        )
+
+        with self.assertWarns(DeprecationWarning):
+            await lm(messages, reasoning_effort="disable")
+        self.assertEqual(mock_completion.call_args.kwargs, kwargs)
+
+    @patch("litellm.acompletion")
+    async def test_unsupported_reasoning_level_rounds_down(self, mock_completion):
+        mock_completion.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        messages = ChatMessages(
+            messages=[ChatMessage(role=ChatRole.USER, content="Hello")]
+        )
+        lm = LanguageModel(model="openai/o-test", supports_reasoning=True)
+        table = {"openai/o-test": {"reasoning_effort_levels": ["low", "high"]}}
+        with patch.dict(litellm.model_cost, table):
+            for asked, sent in [("xhigh", "high"), ("medium", "low"), ("minimal", "low")]:
+                with self.assertWarns(UserWarning):
+                    await lm(messages, reasoning_effort=asked)
+                self.assertEqual(
+                    mock_completion.call_args.kwargs["reasoning_effort"], sent
+                )
+            await lm(messages, reasoning_effort="high")
+            self.assertEqual(mock_completion.call_args.kwargs["reasoning_effort"], "high")
+
+    @patch("litellm.acompletion")
+    async def test_reasoning_effort_none_noop_for_non_ollama(self, mock_completion):
+        """Opt-in providers reason only when enabled, so "none" sends no
         `think` flag (it is ollama-specific and would be rejected elsewhere).
         """
         mock_completion.return_value = {"choices": [{"message": {"content": "ok"}}]}
@@ -549,7 +594,7 @@ class LanguageModelTest(testing.TestCase):
         )
 
         lm = LanguageModel(model="openai/gpt-4o-mini")
-        await lm(messages, reasoning_effort="disable")
+        await lm(messages, reasoning_effort="none")
         self.assertNotIn("think", mock_completion.call_args.kwargs)
 
     @patch("litellm.acompletion")
@@ -592,7 +637,7 @@ class LanguageModelTest(testing.TestCase):
             with self.subTest(model=model):
                 # Every model expecting an off switch reasons natively.
                 lm = LanguageModel(model=model, supports_reasoning=bool(sent))
-                await lm(messages, reasoning_effort="disable")
+                await lm(messages, reasoning_effort="none")
                 kwargs = mock_completion.call_args.kwargs
                 keys = ("thinking", "reasoning_effort", "extra_body")
                 got = {k: kwargs[k] for k in keys if k in kwargs}
@@ -1129,6 +1174,21 @@ class LMFileCacheTest(testing.TestCase):
         self.assertEqual(restored.cache_dir, cache_dir)
         self.assertIsNotNone(restored._file_cache)
 
+    def test_credentials_are_not_serialized(self):
+        lm = LanguageModel(
+            model="openai/gpt-4o",
+            api_key="sk-SECRET",
+            aws_session_token="tok",
+            extra_headers={"Authorization": "Bearer x"},
+            temperature=0.2,
+            max_tokens=16,
+        )
+        config = lm.get_config()
+        self.assertNotIn("sk-SECRET", str(config))
+        self.assertNotIn("aws_session_token", config)
+        self.assertNotIn("extra_headers", config)
+        self.assertEqual((config["temperature"], config["max_tokens"]), (0.2, 16))
+
 
 class SupportedProvidersTest(testing.TestCase):
     def test_lists_every_provider_prefix(self):
@@ -1217,6 +1277,12 @@ class SupportedProvidersTest(testing.TestCase):
         self.assertEqual(
             called["response_format"]["json_schema"]["schema"], Answer.get_schema()
         )
+
+    @patch.dict(os.environ, {}, clear=False)
+    def test_vllm_defaults_to_the_v1_endpoint(self):
+        os.environ.pop("HOSTED_VLLM_API_BASE", None)
+        lm = LanguageModel(model="vllm/Qwen/Qwen3-8B")
+        self.assertEqual(lm.api_base, "http://localhost:8000/v1")
 
     def test_mirai_keeps_an_explicit_api_base(self):
         lm = LanguageModel(
@@ -1342,6 +1408,35 @@ class ToolWireFormatTest(testing.TestCase):
         self.assertEqual(parameters["type"], "object")
         self.assertEqual(set(parameters["properties"]), {"query", "limit"})
         self.assertEqual(sorted(parameters["required"]), ["limit", "query"])
+
+    async def test_fallback_receives_the_tools(self):
+        calls = []
+
+        async def fake_acompletion(**kwargs):
+            calls.append(kwargs)
+            if kwargs["model"] == "openai/primary":
+                raise RuntimeError("primary down")
+            return {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "hi"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+
+        fallback = LanguageModel(model="openai/backup", retry=1)
+        lm = LanguageModel(model="openai/primary", retry=1, fallback=fallback)
+        messages = ChatMessages(messages=[ChatMessage(role="user", content="hi")])
+        extra = {"type": "function", "function": {"name": "raw", "parameters": {}}}
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with patch("litellm.acompletion", side_effect=fake_acompletion):
+                await lm(messages, tools=[self._tool()], tool_schemas=[extra])
+        self.assertEqual(
+            [[t["function"]["name"] for t in c["tools"]] for c in calls],
+            [["search", "raw"], ["search", "raw"]],
+        )
 
 
 class _FinishReasonAnswer(DataModel):
@@ -1847,7 +1942,7 @@ class CapabilityFlagsTest(testing.TestCase):
         server, base = self._serve(reasoning=True)
         lm = LanguageModel(model="vllm/Qwen/Qwen3-8B", api_base=f"{base}/v1")
 
-        await self._ask(lm, effort="disable")
+        await self._ask(lm, effort="none")
 
         self.assertEqual(server.probes, [])
         self.assertEqual(
@@ -1894,8 +1989,8 @@ class CapabilityFlagsTest(testing.TestCase):
             supports_reasoning=False,
         )
 
-        await self._ask(thinking, effort="disable")
-        await self._ask(plain, effort="disable")
+        await self._ask(thinking, effort="none")
+        await self._ask(plain, effort="none")
 
         self.assertEqual(server.requests[0]["reasoning"], {"enabled": False})
         self.assertNotIn("reasoning_effort", server.requests[0])

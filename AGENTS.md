@@ -2,8 +2,9 @@
 
 ## Project Overview
 
-Synalinks is a neuro-symbolic Language Model (LM) framework inspired by Keras. It provides a declarative API for building, training, and deploying LM-based applications including RAGs, autonomous agents, and self-evolving reasoning systems
-by composing modules like layers in deep learning.
+Synalinks is a neuro-symbolic Language Model (LM) framework inspired by Keras. It provides a declarative API for building, training, and deploying LM-based applications including RAGs, autonomous agents, and self-evolving reasoning systems by composing modules like layers in deep learning.
+
+Its philosophy: Keras, but with JSON data models instead of tensors and JSON schemas instead of tensor shapes. It focuses only on gradient-free learning: in-context learning (updating what the LM sees, such as prompts and examples) and out-of-context learning (knowledge bases used as extensible memory at runtime through tool calls). Evaluation is central: rewards and metrics measure the success of a program, the equivalent of a deep learning model.
 
 ## Development Commands
 
@@ -29,6 +30,49 @@ uv run pytest synalinks/src/path/to/test_file.py::test_function_name -v
 # Build documentation
 ./shell/doc.sh
 ```
+
+## Methodology for long running tasks (batch issue fixing, multi-file reviews, etc.)
+
+At the start of every session, read `task_tracker.json` at the repo root if it exists: it records where a previous session stopped (crash, context reset, interruption). Resume from the first task with `"is_finished": false` in the first goal entry. If the next goal entry has an empty task list, it has not been planned yet: plan it (steps 1 and 2 below) and update the tracker before starting.
+
+1. Gather all the information you need first: browse the relevant issues, files and external documentation quickly.
+
+2. Add a goal entry to `task_tracker.json` at the repo root listing every task, in exactly this format (valid JSON, same keys and nesting; do not rename, add or drop fields):
+
+```json
+[
+  {
+    "goal": "one line describing the overall objective",
+    "tasks": [
+      {
+        "key": "task-name-1",
+        "title": "one line summary (also the issue/PR title)",
+        "labels": ["bug"],
+        "description": "full description: what to do, how to verify it",
+        "is_finished": false,
+        "files": ["synalinks/src/path/to/file.py"],
+        "url": "https://github.com/SynaLinks/synalinks/issues/123"
+      }
+    ]
+  }
+]
+```
+
+   Update the file as soon as a task is done (`"is_finished": true`, fill `url` with the issue/PR link), never in a batch at the end, so a crash loses at most one task. When every task of a goal is finished, remove that goal entry from the tracker.
+
+3. Work on one task at a time. Use tests to verify your assumptions and keep the code minimal (removing unnecessary code is better than adding). Use `/ponytail` all the time.
+
+4. Be as autonomous as possible. If something is undecided or needs human approval, open a GitHub issue tagged as such and move on to the next task.
+
+5. Think about the scope of the framework and the bigger picture when making architectural decisions: the software takes inspiration from ML frameworks like Keras and JAX, repurposed for neuro-symbolic AI. Be serious in your work, no laziness accepted.
+
+6. NEVER stop until the goal is reached. If the user gives you new goals along the way, append them to `task_tracker.json` with an empty task list: an empty list means the goal is waiting to be planned.
+
+`task_tracker.json` is gitignored and must never be committed.
+
+## Code is the memory
+
+Never rely on your own internal memory (auto-memory files, recollections from past sessions): it is often stale. The code is law: it is the memory. Before acting on anything remembered (a function, flag, file, behavior or design decision), verify it against the current code, tests and git history, and trust the code when they disagree. The only persistent state for ongoing work is `task_tracker.json`.
 
 ## Architecture
 
@@ -64,10 +108,10 @@ The framework follows a Keras-like pattern with these core abstractions:
 
 ### Backend
 
-Uses Pydantic as the data backend (`synalinks/src/backend/pydantic/`). The backend provides:
-- `Variable`: Trainable state containers
-- `SymbolicDataModel`/`JsonDataModel`: Data model representations
-- Name scoping and state management
+Uses Pydantic as the data backend: `synalinks/src/backend/pydantic/` holds the `DataModel` base (`core.py`) and the built-in data models. The backend-agnostic primitives live in `synalinks/src/backend/common/`:
+- `Variable`: Trainable state containers (`variables.py`)
+- `SymbolicDataModel`/`JsonDataModel`: Data model representations (`symbolic_data_model.py`, `json_data_model.py`)
+- Name scoping and state management (`name_scope.py`, `global_state.py`)
 
 ### Serialization
 

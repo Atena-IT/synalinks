@@ -95,7 +95,11 @@ class ResourceLoadTest(testing.TestCase):
         threads, fds = threading.active_count(), len(os.listdir("/proc/self/fd"))
         for _ in range(RUNS):
             await run()
-        gc.collect()
+            # Collect each run's cyclic garbage as it comes: left to pile up, it
+            # raises the allocator's high-water mark, which RSS keeps after a
+            # late collect though nothing is retained. A leak is kept alive and
+            # still shows.
+            gc.collect()
         self.assertEqual(set(Sandbox.live_sandboxes) - live, set())
         self.assertLessEqual(threading.active_count(), threads)
         self.assertLessEqual(len(os.listdir("/proc/self/fd")), fds)
@@ -123,8 +127,12 @@ class ResourceLoadTest(testing.TestCase):
             kept.append(program)
             return program
 
+        checkpoints = self.get_temp_dir()
         tuner = types.SimpleNamespace(
             hypermodel=types.SimpleNamespace(build=build),
+            _get_checkpoint_fname=lambda trial_id: os.path.join(
+                checkpoints, f"{trial_id}.variables.json"
+            ),
             oracle=types.SimpleNamespace(
                 objective=types.SimpleNamespace(name="reward", direction="max")
             ),
@@ -133,7 +141,12 @@ class ResourceLoadTest(testing.TestCase):
 
         async def trial():
             await keras_tuner_utils._run_trial_async(
-                tuner, types.SimpleNamespace(hyperparameters=None), x=x, verbose=0
+                tuner,
+                types.SimpleNamespace(
+                    hyperparameters=types.SimpleNamespace(values={}), trial_id="0"
+                ),
+                x=x,
+                verbose=0,
             )
 
         await self._under_load(trial)

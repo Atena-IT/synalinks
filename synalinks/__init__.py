@@ -170,6 +170,7 @@ from synalinks.api import SandboxException
 from synalinks.api import Score
 from synalinks.api import SelfCritique
 from synalinks.api import Sequential
+from synalinks.api import SequentialPlanSynthesis
 from synalinks.api import SimilaritySearch
 from synalinks.api import SQLAgent
 from synalinks.api import Stamp
@@ -194,6 +195,7 @@ from synalinks.api import ToolPermission
 from synalinks.api import ToolUse
 from synalinks.api import TopicAdherence
 from synalinks.api import Toxicity
+from synalinks.api import TraceDataset
 from synalinks.api import Trainable
 from synalinks.api import TurnFaithfulness
 from synalinks.api import TurnRelevancy
@@ -202,6 +204,7 @@ from synalinks.api import VectorRAGAgent
 from synalinks.api import WriteInfo
 from synalinks.api import Xor
 from synalinks.api import __version__
+from synalinks.api import allow_media_root
 from synalinks.api import api_base
 from synalinks.api import backend
 from synalinks.api import callbacks

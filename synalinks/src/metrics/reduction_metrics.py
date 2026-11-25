@@ -5,13 +5,11 @@
 import inspect
 from typing import Optional
 
-from synalinks.src import ops
-from synalinks.src import rewards
-from synalinks.src import tree
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend import DataModel
 from synalinks.src.backend.common import numpy
 from synalinks.src.metrics.metric import Metric
+from synalinks.src.metrics.metric import apply_masks
 from synalinks.src.saving import serialization_lib
 
 
@@ -256,7 +254,10 @@ class MeanMetricWrapper(Mean):
     ```python
     program.compile(
         metrics=[
-            synalinks.metrics.MeanMetricWrapper(),
+            synalinks.metrics.MeanMetricWrapper(
+                synalinks.rewards.exact_match,
+                in_mask=["answer"],
+            ),
         ],
     )
     ```
@@ -294,52 +295,15 @@ class MeanMetricWrapper(Mean):
         self._fn = fn
         self._fn_kwargs = kwargs
 
-        # If we are wrapping a Synalinks reward, register the metric's
-        # direction as "up" (needs to be maximized during training).
-        if (
-            self._fn in rewards.ALL_OBJECTS
-            or hasattr(self._fn, "__class__")
-            and self._fn.__class__ in rewards.ALL_OBJECTS
-        ):
-            self.direction = "up"
-
     async def update_state(self, y_true, y_pred):
-        y_pred = tree.map_structure(lambda x: ops.convert_to_json_data_model(x), y_pred)
-        y_true = tree.map_structure(lambda x: ops.convert_to_json_data_model(x), y_true)
-        if self.in_mask or self.in_mask_pattern:
-            y_pred = tree.map_structure(
-                lambda x: (
-                    x.in_mask(mask=self.in_mask, pattern=self.in_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_pred,
-            )
-            y_true = tree.map_structure(
-                lambda x: (
-                    x.in_mask(mask=self.in_mask, pattern=self.in_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_true,
-            )
-        if self.out_mask or self.out_mask_pattern:
-            y_pred = tree.map_structure(
-                lambda x: (
-                    x.out_mask(mask=self.out_mask, pattern=self.out_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_pred,
-            )
-            y_true = tree.map_structure(
-                lambda x: (
-                    x.out_mask(mask=self.out_mask, pattern=self.out_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_true,
-            )
+        y_true, y_pred = apply_masks(
+            y_true,
+            y_pred,
+            in_mask=self.in_mask,
+            in_mask_pattern=self.in_mask_pattern,
+            out_mask=self.out_mask,
+            out_mask_pattern=self.out_mask_pattern,
+        )
         values = await self._fn(y_true, y_pred, **self._fn_kwargs)
         return await super().update_state(values)
 

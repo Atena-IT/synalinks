@@ -50,7 +50,7 @@ class IsFunctionLikeTest(testing.TestCase):
 
 class CompileMetricsValidationTest(testing.TestCase):
     """Cover the error paths in `CompileMetrics.__init__` /
-    `_build_metrics_set` that fire before any update_state call."""
+    `build` that fire before any update_state call."""
 
     def test_rejects_non_collection_metrics(self):
         with self.assertRaisesRegex(ValueError, "list, tuple, or dict"):
@@ -99,7 +99,7 @@ class CompileMetricsValidationTest(testing.TestCase):
 
 
 class CompileMetricsBuildErrorPathsTest(testing.TestCase):
-    """`_build_metrics_set` rejects malformed metric configs at build time."""
+    """`CompileMetrics.build` rejects malformed metric configs at build time."""
 
     def _build(self, **kw):
         # Build is sync; the y_true/y_pred shape is what triggers the
@@ -243,3 +243,15 @@ class CompileRewardMultiOutputTest(testing.TestCase):
 
         result = await compile_reward(y_true, y_pred)
         self.assertEqual(float(result), 1.0)
+
+    async def test_reward_weights_and_trackers(self):
+        y_true = [Answer(answer="x"), Answer(answer="y")]
+        y_pred = [Answer(answer="x"), Answer(answer="WRONG")]
+        cases = (([1.0, 0.0], 1.0), ([0.0, 1.0], 0.0), ([5.0, 5.0], 5.0))
+        for weights, expected in cases:
+            cr = CompileReward([ExactMatch(), ExactMatch()], reward_weights=weights)
+            self.assertEqual(float(await cr(y_true, y_pred)), expected)
+            self.assertEqual(await cr.compute_batch([y_true], [y_pred]), [expected])
+        names = [m.name for m in cr.metrics]
+        self.assertEqual(len(set(names)), 2)
+        self.assertEqual([m.result() for m in cr.metrics], [1.0, 0.0])

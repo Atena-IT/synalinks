@@ -154,6 +154,32 @@ class DatabaseAdapterParityTest(testing.TestCase):
                 self.assertTrue(await a.drop_table("Customer"))
                 self.assertFalse(await a.drop_table("Customer"))
 
+    async def test_rename(self):
+        for name, cls, scheme, ext in ADAPTERS:
+            with self.subTest(adapter=name):
+                a = self._make(cls, scheme, ext, data_models=[Customer])
+                await a.update(
+                    Customer(id="C1", name="Alice", country="USA").to_json_data_model()
+                )
+                model = await a.rename(
+                    "Customer", table_name="Client", table_description="Clients"
+                )
+                self.assertEqual(model.get_schema()["title"], "Client")
+                self.assertEqual(model.get_schema()["description"], "Clients")
+                self.assertEqual(
+                    [m.get_schema()["title"] for m in a.get_symbolic_data_models()],
+                    ["Client"],
+                )
+                self.assertIn("Client", a.data_models)
+                self.assertNotIn("Customer", a.data_models)
+                self.assertEqual(
+                    (await a.get("C1", table_name="Client")).get("name"), "Alice"
+                )
+                hits = await a.fulltext_search("Alice", table_name="Client")
+                self.assertEqual([h["id"] for h in hits], ["C1"])
+                with self.assertRaises(ValueError):
+                    await a.rename("DoesNotExist", table_name="X")
+
     async def test_get_symbolic_data_models(self):
         for name, cls, scheme, ext in ADAPTERS:
             with self.subTest(adapter=name):
@@ -240,6 +266,9 @@ class DatabaseAdapterParityTest(testing.TestCase):
         for name, cls, scheme, ext in ADAPTERS:
             with self.subTest(adapter=name):
                 a = self._make(cls, scheme, ext, data_models=[Customer])
+                self.assertEqual(
+                    await a.fulltext_search("Quick", table_name="Customer"), []
+                )
                 await a.update(
                     [
                         Customer(
@@ -336,6 +365,29 @@ class DatabaseAdapterParityTest(testing.TestCase):
                 model = await a.from_json(path, table_name="People")
                 self.assertEqual(model.get_schema()["title"], "People")
                 self.assertEqual(len(await a.getall(table_name="People", limit=10)), 2)
+
+    async def test_from_csv_merges_into_existing_table(self):
+        for name, cls, scheme, ext in ADAPTERS:
+            with self.subTest(adapter=name):
+                d = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, d, True)
+                path = os.path.join(d, "customer.csv")
+                with open(path, "w") as f:
+                    f.write("id,name,country\nC1,Alicia,USA\nC2,Bob,UK\n")
+
+                a = self._make(cls, scheme, ext, data_models=[Customer])
+                await a.update(
+                    [
+                        Customer(id="C1", name="Alice", country="USA"),
+                        Customer(id="C3", name="Carol", country="FR"),
+                    ]
+                )
+                await a.from_csv(path, table_name="Customer")
+                rows = await a.sql("SELECT id, name FROM Customer ORDER BY id")
+                self.assertEqual(
+                    [(r["id"], r["name"]) for r in rows],
+                    [("C1", "Alicia"), ("C2", "Bob"), ("C3", "Carol")],
+                )
 
     # -- vector / hybrid (mocked embeddings) -----------------------------------
 

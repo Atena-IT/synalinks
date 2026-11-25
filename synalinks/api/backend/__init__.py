@@ -36,6 +36,7 @@ from synalinks.src.backend.config import set_epsilon as set_epsilon
 from synalinks.src.backend.config import set_floatx as set_floatx
 from synalinks.src.backend.config import set_seed as set_seed
 from synalinks.src.backend.config import trace_recording_dir as trace_recording_dir
+from synalinks.src.backend.config import trace_recording_format as trace_recording_format
 from synalinks.src.backend.pydantic.base import Embedding as Embedding
 from synalinks.src.backend.pydantic.base import EmbeddingRequest as EmbeddingRequest
 from synalinks.src.backend.pydantic.base import Embeddings as Embeddings
@@ -146,6 +147,7 @@ from synalinks.src.backend.pydantic.knowledge import is_relation as is_relation
 from synalinks.src.backend.pydantic.knowledge import is_relations as is_relations
 from synalinks.src.backend.pydantic.media import Audio as Audio
 from synalinks.src.backend.pydantic.media import Image as Image
+from synalinks.src.backend.pydantic.media import allow_media_root as allow_media_root
 from synalinks.src.backend.pydantic.metrics import FineScore as FineScore
 from synalinks.src.backend.pydantic.metrics import Rating as Rating
 from synalinks.src.backend.pydantic.metrics import Rating10 as Rating10

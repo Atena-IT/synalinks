@@ -37,9 +37,11 @@ from synalinks.src.backend import EmbeddingRequest
 from synalinks.src.backend import JsonDataModel
 from synalinks.src.backend import SymbolicDataModel
 from synalinks.src.knowledge_bases.adapters_utils import format_search_results
+from synalinks.src.knowledge_bases.adapters_utils import json_columns
 from synalinks.src.knowledge_bases.adapters_utils import minmax_normalize_scores
 from synalinks.src.knowledge_bases.adapters_utils import normalize_query_vectors
 from synalinks.src.knowledge_bases.adapters_utils import resolve_db_path
+from synalinks.src.knowledge_bases.adapters_utils import resolve_ref
 from synalinks.src.knowledge_bases.adapters_utils import to_pascal_identifier
 from synalinks.src.knowledge_bases.adapters_utils import to_snake_identifier
 from synalinks.src.knowledge_bases.database_adapters.database_adapter import (
@@ -84,6 +86,48 @@ def _stem(path: str) -> str:
 
 
 class LanceDBAdapter(DatabaseAdapter):
+    """LanceDB-backed implementation of `DatabaseAdapter`.
+
+    You don't create it directly: a `KnowledgeBase` uses it for a
+    `lancedb://` URI and forwards its arguments. It is a drop-in alternative
+    to `DuckDBAdapter` (same methods, same results), suited to vector-heavy
+    workloads.
+
+    Example:
+
+    ```python
+    import synalinks
+
+    class Document(synalinks.DataModel):
+        id: str = synalinks.Field(description="The document id")
+        title: str = synalinks.Field(description="The document title")
+        content: str = synalinks.Field(description="The document content")
+
+    knowledge_base = synalinks.KnowledgeBase(
+        uri="lancedb://./documents.lance",
+        data_models=[Document],
+        embedding_model=synalinks.EmbeddingModel(model="ollama/mxbai-embed-large"),
+    )
+
+    await knowledge_base.update(
+        [
+            Document(id="1", title="Paris", content="Paris is the capital of France."),
+            Document(id="2", title="Rome", content="Rome is the capital of Italy."),
+        ]
+    )
+
+    # Native vector search, Tantivy full-text, fused by reciprocal rank
+    results = await knowledge_base.hybrid_fts_search(
+        "capital of France", table_name="Document", k=5
+    )
+
+    # SELECT-only SQL, run by DuckDB over the Lance tables
+    rows = await knowledge_base.sql("SELECT title FROM Document")
+    ```
+
+    For tests, `lancedb://:memory:` keeps the tables in memory.
+    """
+
     def __init__(
         self,
         uri=None,
@@ -96,6 +140,31 @@ class LanceDBAdapter(DatabaseAdapter):
         name=None,
         **kwargs,
     ):
+        """Initialize the LanceDB adapter.
+
+        Args:
+            uri (str): `lancedb://<path>`, a folder holding one Lance dataset
+                per table, or `lancedb://:memory:` (in-memory). When omitted,
+                resolves to
+                `{synalinks_home()}/{name or 'database'}.lance`.
+            embedding_model (EmbeddingModel): Optional. Enables vector
+                similarity search (and the vector half of hybrid search),
+                by adding an embedding column
+                to each table.
+            data_models (list): The `DataModel` classes to create tables
+                for (one table per model, named after its schema `title`).
+                When omitted, the tables already in the folder are used.
+            metric (str): Vector distance: `"cosine"` (default), `"l2sq"`
+                (squared Euclidean) or `"ip"` (inner product). Scores match
+                `DuckDBAdapter`'s for the same metric.
+            vss_key (str): Name of the embedding column. Defaults to
+                `"embedding"`.
+            vector_dim (int): Embedding dimension. Inferred from the
+                embedding model on the first write when omitted.
+            wipe_on_start (bool): Whether to clear the database on init.
+                Defaults to `False`.
+            name (str): Optional adapter name, also the default folder stem.
+        """
         import lancedb
 
         # ``lancedb://<path>`` -> ``<path>``; ``None`` -> ~/.synalinks/<name>.lance
@@ -121,7 +190,8 @@ class LanceDBAdapter(DatabaseAdapter):
         self.vss_key = vss_key
         self.name = name
 
-        self._db = lancedb.connect(self.uri)
+        # LanceDB's own in-memory store, private to this connection.
+        self._db = lancedb.connect("memory://" if self.uri == ":memory:" else self.uri)
 
         if wipe_on_start:
             self.wipe_database()
@@ -144,19 +214,6 @@ class LanceDBAdapter(DatabaseAdapter):
 
     # -- schema mapping --------------------------------------------------------
 
-    @staticmethod
-    def _resolve_ref(spec: dict, defs: dict) -> dict:
-        if isinstance(spec, dict) and "$ref" in spec:
-            key = spec["$ref"].rsplit("/", 1)[-1]
-            return dict(defs.get(key, {}))
-        return spec
-
-    def _get_id_key(self, schema: dict) -> str:
-        props = schema.get("properties") if isinstance(schema, dict) else None
-        if not props:
-            raise ValueError("Cannot determine primary key: schema has no `properties`.")
-        return _column_identifier(next(iter(props.keys())))
-
     def _json_schema_to_arrow(self, json_schema: dict):
         """Build a PyArrow schema + the set of JSON-encoded column names."""
         props = json_schema.get("properties", {})
@@ -165,7 +222,7 @@ class LanceDBAdapter(DatabaseAdapter):
         json_cols = set()
         for raw_name, raw_spec in props.items():
             name = _column_identifier(raw_name)
-            spec = self._resolve_ref(raw_spec, defs)
+            spec = resolve_ref(raw_spec, defs)
             t = spec.get("type")
             if name == self.vss_key:
                 if self.vector_dim:
@@ -181,7 +238,7 @@ class LanceDBAdapter(DatabaseAdapter):
             elif t == "boolean":
                 fields.append(pa.field(name, pa.bool_()))
             elif t == "array":
-                items = self._resolve_ref(spec.get("items", {}), defs)
+                items = resolve_ref(spec.get("items", {}), defs)
                 it = items.get("type")
                 if it == "number":
                     fields.append(pa.field(name, pa.list_(pa.float64())))
@@ -259,21 +316,6 @@ class LanceDBAdapter(DatabaseAdapter):
             "properties": props,
         }
 
-    def _json_columns(self, json_schema: dict) -> set:
-        props = json_schema.get("properties", {})
-        defs = json_schema.get("$defs", {})
-        cols = set()
-        for raw_name, raw_spec in props.items():
-            spec = self._resolve_ref(raw_spec, defs)
-            t = spec.get("type")
-            if t == "object":
-                cols.add(_column_identifier(raw_name))
-            elif t == "array":
-                items = self._resolve_ref(spec.get("items", {}), defs)
-                if items.get("type") == "object":
-                    cols.add(_column_identifier(raw_name))
-        return cols
-
     def _string_columns(self, json_schema: dict, *, exclude_pk=False) -> List[str]:
         id_key = self._get_id_key(json_schema)
         out = []
@@ -282,7 +324,7 @@ class LanceDBAdapter(DatabaseAdapter):
             name = _column_identifier(raw_name)
             if exclude_pk and name == id_key:
                 continue
-            spec = self._resolve_ref(raw_spec, defs)
+            spec = resolve_ref(raw_spec, defs)
             if (
                 spec.get("type") == "string"
                 and spec.get("format") not in _DATE_LIKE_FORMATS
@@ -321,16 +363,6 @@ class LanceDBAdapter(DatabaseAdapter):
             return
         arrow_schema, _ = self._json_schema_to_arrow(json_schema)
         self._db.create_table(table, schema=arrow_schema)
-
-    def _row_for_storage(self, json_data: dict, json_cols: set, arrow_schema) -> dict:
-        row = {}
-        for field in arrow_schema:
-            name = field.name
-            value = json_data.get(name)
-            if name in json_cols and value is not None and not isinstance(value, str):
-                value = orjson.dumps(value).decode()
-            row[name] = value
-        return row
 
     def _decode_row(self, row: dict, json_cols: set, remove_embedding: bool) -> dict:
         out = {}
@@ -461,11 +493,18 @@ class LanceDBAdapter(DatabaseAdapter):
                     "arrow_schema": arrow_schema,
                 }
             bucket = buckets[table]
-            bucket["rows"].append(
-                self._row_for_storage(
-                    json_data, bucket["json_cols"], bucket["arrow_schema"]
-                )
-            )
+            row = {}
+            for field in bucket["arrow_schema"]:
+                name = field.name
+                value = json_data.get(name)
+                if (
+                    name in bucket["json_cols"]
+                    and value is not None
+                    and not isinstance(value, str)
+                ):
+                    value = orjson.dumps(value).decode()
+                row[name] = value
+            bucket["rows"].append(row)
             ids.append(id_val)
 
         for table, bucket in buckets.items():
@@ -476,20 +515,22 @@ class LanceDBAdapter(DatabaseAdapter):
                 .when_not_matched_insert_all()
                 .execute(bucket["rows"])
             )
-            schema = self._table_json_schema(table, remove_embedding=False)
-            # LanceDB FTS indexes are one-per-field, so build a separate
-            # inverted index per text column; ``fulltext_search`` then queries
-            # across all of them via ``query_type="fts"``.
-            for col in self._string_columns(schema, exclude_pk=True):
-                try:
-                    tbl.create_fts_index(col, replace=True)
-                except Exception as e:
-                    warnings.warn(
-                        f"FTS index rebuild failed for '{table}.{col}'; "
-                        f"fulltext_search results may be stale. ({e})"
-                    )
+            self._rebuild_fts_indexes(tbl, table)
 
         return ids[0] if return_single else ids
+
+    def _rebuild_fts_indexes(self, tbl, table: str):
+        """Build one FTS index per text column (LanceDB FTS indexes are
+        one-per-field); ``fulltext_search`` queries across all of them."""
+        schema = self._table_json_schema(table, remove_embedding=False)
+        for col in self._string_columns(schema, exclude_pk=True):
+            try:
+                tbl.create_fts_index(col, replace=True)
+            except Exception as e:
+                warnings.warn(
+                    f"FTS index rebuild failed for '{table}.{col}'; "
+                    f"fulltext_search results may be stale. ({e})"
+                )
 
     async def get(
         self,
@@ -520,7 +561,7 @@ class LanceDBAdapter(DatabaseAdapter):
         schema = self._table_json_schema(table, remove_embedding=remove_embedding)
         full_schema = self._table_json_schema(table, remove_embedding=False)
         id_key = self._get_id_key(full_schema)
-        json_cols = self._json_columns(full_schema)
+        json_cols = json_columns(full_schema)
 
         tbl = self._db.open_table(table)
         predicate = f"{id_key} IN ({', '.join(_sql_literal(i) for i in ids)})"
@@ -571,7 +612,7 @@ class LanceDBAdapter(DatabaseAdapter):
         schema = self._table_json_schema(table, remove_embedding=remove_embedding)
         full_schema = self._table_json_schema(table, remove_embedding=False)
         id_key = self._get_id_key(full_schema)
-        json_cols = self._json_columns(full_schema)
+        json_cols = json_columns(full_schema)
 
         tbl = self._db.open_table(table)
         try:
@@ -646,6 +687,10 @@ class LanceDBAdapter(DatabaseAdapter):
     ) -> SymbolicDataModel:
         """Rename a table and/or update its schema description.
 
+        LanceDB OSS has no table rename, so a new name copies the rows
+        (and the stored schema, retitled) into a new table, rebuilds its
+        FTS indexes and drops the old table.
+
         Args:
             source: ``SymbolicDataModel`` for the table to rename, or its
                 name as a string. Always normalized to PascalCase.
@@ -657,28 +702,56 @@ class LanceDBAdapter(DatabaseAdapter):
             reflecting its current column shape and the supplied
             description.
         """
+        if table_name is None and table_description is None:
+            raise ValueError(
+                "rename(): pass at least one of `table_name=` or `table_description=`."
+            )
         old = table_identifier(
             source.get_schema()["title"] if hasattr(source, "get_schema") else source
         )
+        if old not in self._db.table_names():
+            raise ValueError(
+                f"rename(): no table named {old!r} found in the knowledge base."
+            )
         new = table_identifier(table_name) if table_name else old
-        if new != old:
-            self._db.rename_table(old, new)
-        schema = self._table_json_schema(new, remove_embedding=False)
+        schema = self._table_json_schema(old, remove_embedding=False)
         schema["title"] = new
         if table_description is not None:
             schema["description"] = table_description
-        return SymbolicDataModel(schema=schema)
+        if new != old:
+            data = self._db.open_table(old).to_arrow()
+            data = data.replace_schema_metadata({_SCHEMA_META_KEY: orjson.dumps(schema)})
+            tbl = self._db.create_table(new, data=data)
+            self._db.drop_table(old)
+            self._rebuild_fts_indexes(tbl, new)
+        renamed_model = SymbolicDataModel(schema=schema)
+        self.data_models.pop(old, None)
+        self.data_models[new] = renamed_model
+        return renamed_model
 
     # -- bulk file loaders -----------------------------------------------------
 
     async def _from_arrow(self, arrow_table, table_name, table_description):
+        """Create ``table_name`` from ``arrow_table``, or upsert its rows by
+        primary key when the table already exists (like `DuckDBAdapter`)."""
         table = table_identifier(table_name)
+        if table in self._db.table_names():
+            json_schema = self._table_json_schema(table, remove_embedding=False)
+            (
+                self._db.open_table(table)
+                .merge_insert(self._get_id_key(json_schema))
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute(arrow_table)
+            )
+            if table_description is not None:
+                json_schema["description"] = table_description
+            return SymbolicDataModel(schema=json_schema)
         json_schema = self._arrow_to_json_schema(table, arrow_table.schema, False)
         if table_description is not None:
             json_schema["description"] = table_description
         metadata = {_SCHEMA_META_KEY: orjson.dumps(json_schema)}
         arrow_table = arrow_table.replace_schema_metadata(metadata)
-        self._db.drop_table(table, ignore_missing=True)
         self._db.create_table(table, data=arrow_table)
         return SymbolicDataModel(schema=json_schema)
 
@@ -810,15 +883,30 @@ class LanceDBAdapter(DatabaseAdapter):
         """Run SQL over the LanceDB tables via DuckDB.
 
         LanceDB has no SQL engine; DuckDB scans each table (registered as an
-        Arrow view under its table name) so arbitrary read-only ``SELECT`` /
-        joins / aggregates work.
+        Arrow view under its table name) so ``SELECT`` / joins / aggregates
+        work. Only ``SELECT`` statements are accepted (the views are read-only
+        snapshots, so a write could not reach LanceDB), and the connection has
+        no access to the host's files.
         """
         import duckdb
 
+        try:
+            statements = duckdb.extract_statements(sql)
+        except duckdb.Error as e:
+            raise duckdb.InvalidInputException(f"Invalid SQL: {e}") from e
+        if not statements:
+            raise duckdb.InvalidInputException("Empty SQL query.")
+        for stmt in statements:
+            if stmt.type != duckdb.StatementType.SELECT:
+                raise duckdb.InvalidInputException(
+                    f"LanceDB SQL only permits SELECT statements; got {stmt.type.name}."
+                )
         con = duckdb.connect(":memory:")
         try:
             for table in self._db.table_names():
                 con.register(table, self._db.open_table(table).to_arrow())
+            # Blocks `read_csv('/etc/passwd')`, `COPY ... TO`; cannot be re-enabled.
+            con.execute("SET enable_external_access=false;")
             arrow_table = con.sql(sql, params=params or None).to_arrow_table()
         finally:
             con.close()
@@ -868,7 +956,7 @@ class LanceDBAdapter(DatabaseAdapter):
         table = table_identifier(table_name)
         full_schema = self._table_json_schema(table, remove_embedding=False)
         id_key = self._get_id_key(full_schema)
-        json_cols = self._json_columns(full_schema)
+        json_cols = json_columns(full_schema)
 
         offset = _SCORE_OFFSET[self.metric]
         tbl = self._db.open_table(table)
@@ -924,14 +1012,15 @@ class LanceDBAdapter(DatabaseAdapter):
         table = table_identifier(table_name)
         full_schema = self._table_json_schema(table, remove_embedding=False)
         id_key = self._get_id_key(full_schema)
-        json_cols = self._json_columns(full_schema)
+        json_cols = json_columns(full_schema)
         if not self._string_columns(full_schema, exclude_pk=True):
             warnings.warn(f"Skipping FTS search for {table}: no text columns to index.")
             return format_search_results([], output_format)
 
         tbl = self._db.open_table(table)
         merged: Dict[Any, Dict[str, Any]] = {}
-        for text in texts:
+        # An empty table has no FTS index yet (built on first insert).
+        for text in texts if tbl.count_rows() else []:
             try:
                 rows = tbl.search(text, query_type="fts").limit(k).to_arrow().to_pylist()
             except Exception as e:
@@ -980,7 +1069,7 @@ class LanceDBAdapter(DatabaseAdapter):
             return format_search_results([], output_format)
         table = table_identifier(table_name)
         full_schema = self._table_json_schema(table, remove_embedding=False)
-        json_cols = self._json_columns(full_schema)
+        json_cols = json_columns(full_schema)
         string_cols = self._string_columns(full_schema, exclude_pk=False)
         if fields is not None:
             requested = {_column_identifier(f) for f in fields}

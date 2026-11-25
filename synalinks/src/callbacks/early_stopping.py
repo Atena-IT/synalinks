@@ -26,25 +26,43 @@ class EarlyStopping(Callback):
 
     Example:
 
-    >>> callback = synalinks.callbacks.EarlyStopping(monitor='reward', patience=3)
-    >>> # This callback will stop the training when there is no improvement in
-    >>> # the loss for three consecutive epochs.
-    >>> program = synalinks.programs.Sequential(
-    ...     [synalinks.modules.Generator(data_model=Answer)])
-    >>> program.compile(
-    ...     synalinks.optimizers.RandomFewShot(),
-    ...     reward=synalinks.rewards.ExactMatch())
-    >>> history = program.fit(
-    ...     ..., epochs=10, batch_size=1, callbacks=[callback], verbose=0)
-    >>> len(history.history['reward'])  # Only 4 epochs are run.
-    4
+    ```python
+    class Query(synalinks.DataModel):
+        query: str
+
+    class Answer(synalinks.DataModel):
+        answer: str
+
+    callback = synalinks.callbacks.EarlyStopping(monitor="reward", patience=3)
+    # This callback will stop the training when there is no improvement in
+    # the reward for three consecutive epochs.
+    inputs = synalinks.Input(data_model=Query)
+    outputs = await synalinks.Generator(
+        data_model=Answer,
+        language_model=synalinks.LanguageModel(model="ollama/mistral"),
+    )(inputs)
+    program = synalinks.Program(inputs=inputs, outputs=outputs)
+    program.compile(
+        synalinks.optimizers.RandomFewShot(),
+        reward=synalinks.rewards.ExactMatch(),
+    )
+    history = await program.fit(
+        x=x_train, y=y_train, epochs=10, batch_size=1, callbacks=[callback], verbose=0
+    )
+    # A reward that plateaus from the first epoch stops after 4 epochs.
+    len(history.history["reward"])
+    ```
 
     Args:
         monitor (str): Quantity to be monitored. Defaults to `val_reward`.
         min_delta (float): Minimum change in the monitored quantity to qualify
             as an improvement, i.e. an absolute change of less than min_delta,
             will count as no improvement. Defaults to `0`.
-        stop_at (float): The value at which we should stop training.
+        stop_at (float): Stop training as soon as the monitored quantity
+            reaches this value (`>=` when maximizing, `<=` when minimizing),
+            once past `start_from_epoch`. Defaults to `None`, which means
+            `1.0` (the best possible reward) when maximizing and no target
+            when minimizing.
         patience (int): Number of epochs with no improvement after which
             training will be stopped. Defaults to `0`.
         verbose (int): Verbosity mode, 0 or 1. Mode 0 is silent, and mode 1
@@ -75,7 +93,7 @@ class EarlyStopping(Callback):
         self,
         monitor="val_reward",
         min_delta=0,
-        stop_at=1.0,
+        stop_at=None,
         patience=0,
         verbose=0,
         mode="auto",
@@ -143,6 +161,8 @@ class EarlyStopping(Callback):
             )
         if self.monitor_op == np.less:
             self.min_delta *= -1
+        elif self.stop_at is None:
+            self.stop_at = 1.0
 
     def on_train_begin(self, logs=None):
         # Allow instances to be re-used
@@ -158,11 +178,13 @@ class EarlyStopping(Callback):
             self._set_monitor_op()
 
         current = self.get_monitor_value(logs)
-        if current is not None and current >= self.stop_at:
-            self.program.stop_training = True
-            return
         if current is None or epoch < self.start_from_epoch:
             # If no monitor value exists or still in initial warm-up stage.
+            return
+        if self.stop_at is not None and (
+            current == self.stop_at or self.monitor_op(current, self.stop_at)
+        ):
+            self.program.stop_training = True
             return
         if self.restore_best_variables and self.best_variables is None:
             # If best variables were never set,
@@ -197,7 +219,10 @@ class EarlyStopping(Callback):
                     "the end of the best epoch: "
                     f"{self.best_epoch + 1}."
                 )
-            self._restore_variables(self.best_variables)
+            for variable, value in zip(
+                self.program.trainable_variables, self.best_variables
+            ):
+                variable.assign(value)
 
     def _snapshot_variables(self):
         """Deep-copy the program's trainable variable values.
@@ -207,11 +232,6 @@ class EarlyStopping(Callback):
         dicts, deep-copied so later in-place updates don't mutate the snapshot.
         """
         return [copy.deepcopy(v.get_json()) for v in self.program.trainable_variables]
-
-    def _restore_variables(self, snapshot):
-        """Assign a previously captured snapshot back onto the program."""
-        for variable, value in zip(self.program.trainable_variables, snapshot):
-            variable.assign(value)
 
     def get_monitor_value(self, logs):
         logs = logs or {}
@@ -224,6 +244,12 @@ class EarlyStopping(Callback):
                     f"Available metrics are: {','.join(list(logs.keys()))}"
                 ),
                 stacklevel=2,
+            )
+        elif isinstance(monitor_value, dict) or np.ndim(monitor_value) > 0:
+            raise ValueError(
+                f"Early stopping needs a scalar metric, but `{self.monitor}` is "
+                f'{monitor_value!r}. Set `average` (e.g. `average="macro"`) '
+                "on the monitored metric."
             )
         return monitor_value
 

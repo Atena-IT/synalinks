@@ -26,7 +26,13 @@ from synalinks.src.optimizers.omega import mutation_instructions
 from synalinks.src.optimizers.omega import similarity_distance
 from synalinks.src.programs import Program
 from synalinks.src.rewards.exact_match import ExactMatch
+from synalinks.src.saving.object_registration import register_synalinks_serializable
 from synalinks.src.testing.test_utils import mock_decision_model
+
+
+@register_synalinks_serializable()
+async def _custom_distance(a, b, embedding_model=None, axis=-1):
+    return 0.0
 
 
 class OMEGATest(testing.TestCase):
@@ -123,6 +129,20 @@ class OMEGATest(testing.TestCase):
         self.assertEqual(config["selection_temperature"], 0.25)
         self.assertEqual(config["merging_rate"], 0.05)
         self.assertEqual(config["population_size"], 15)
+
+    def test_unknown_kwargs_rejected(self):
+        with self.assertRaises(ValueError):
+            OMEGA(populaton_size=5)
+
+    def test_sampling_temperature_round_trip(self):
+        optimizer = OMEGA(sampling_temperature=0.9)
+        restored = OMEGA.from_config(optimizer.get_config())
+        self.assertEqual(restored.sampling_temperature, 0.9)
+
+    def test_distance_function_round_trip(self):
+        optimizer = OMEGA(distance_function=_custom_distance)
+        config = json.loads(json.dumps(optimizer.get_config()))
+        self.assertIs(OMEGA.from_config(config).distance_function, _custom_distance)
 
     async def test_competition_single_candidate(self):
         """Test competition with single candidate returns it unchanged."""
@@ -810,7 +830,28 @@ class HardExampleMemoryTest(testing.TestCase):
         optimizer.observe_training_batch(*self._batch(["h"], [0.0]))
         optimizer.observe_training_batch(*self._batch(["h"], [0.0]))
         self.assertEqual(optimizer.hard_examples(), [])
-        self.assertEqual(optimizer._difficulty, {})
+        self.assertEqual(optimizer._hard_example_memory.get("entries"), [])
+
+    async def test_memory_survives_state_tree_round_trip(self):
+        async def make():
+            x0 = Input(data_model=_Ticket)
+            x1 = await Generator(
+                data_model=_Team, language_model=LanguageModel(model="ollama/mistral")
+            )(x0)
+            program = Program(inputs=x0, outputs=x1)
+            program.compile(reward=ExactMatch(), optimizer=OMEGA(name="omega"))
+            return program
+
+        program = await make()
+        for _ in range(2):
+            program.optimizer.observe_training_batch(*self._batch(["h"], [0.0]))
+        state = json.loads(json.dumps(program.get_state_tree()))
+        restored = await make()
+        restored.set_state_tree(state)
+        self.assertEqual(
+            restored.optimizer.hard_examples(), program.optimizer.hard_examples()
+        )
+        self.assertEqual(len(restored.optimizer.hard_examples()), 1)
 
     def test_hard_example_params_in_config_and_validated(self):
         optimizer = OMEGA(nb_hard_examples=2, hard_example_min_observations=4)

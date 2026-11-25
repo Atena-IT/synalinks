@@ -38,28 +38,30 @@ class InMask(Module):
         )
 
     async def main():
-        inputs = Input(data_model=Document)
-        summary = synalinks.ChainOfThought(
+        inputs = synalinks.Input(data_model=Document)
+        summary = await synalinks.ChainOfThought(
             data_model=Summary,
             language_model=language_model,
         )(inputs)
-        masked_summary = synalinks.InMask(
-            # remove the thinking field from the chain of thought
-            # by keeping only the summary
+        masked_summary = await synalinks.InMask(
+            # keep only the summary field
             mask=["summary"],
         )(summary)
 
-        program = Program(
+        program = synalinks.Program(
             inputs=inputs,
             outputs=masked_summary,
             name="summary_generator",
             description="Generate a summary from a document",
         )
 
+    asyncio.run(main())
     ```
 
     Args:
         mask (list): The list of keys to keep.
+        pattern (str): Optional. A regex; the fields whose key matches it are
+            kept. At least one of `mask` or `pattern` is required.
         name (str): Optional. The name of the module.
         description (str): Optional. The description of the module.
         trainable (bool): Whether the module's variables should be trainable.
@@ -74,11 +76,15 @@ class InMask(Module):
         description=None,
         trainable=False,
     ):
-        if not mask or not isinstance(mask, list):
-            raise ValueError("`mask` parameter should be a list of fields to keep")
+        if not (mask or pattern) or (mask and not isinstance(mask, list)):
+            raise ValueError(
+                "`mask` parameter should be a list of fields to keep, "
+                "or a `pattern` should be given"
+            )
         super().__init__(
             name=name,
             description=description,
+            trainable=trainable,
         )
         self.mask = mask
         self.pattern = pattern

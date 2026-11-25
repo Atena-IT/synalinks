@@ -174,6 +174,7 @@ from synalinks.src.backend.pydantic.knowledge import is_relation as is_relation
 from synalinks.src.backend.pydantic.knowledge import is_relations as is_relations
 from synalinks.src.backend.pydantic.media import Audio as Audio
 from synalinks.src.backend.pydantic.media import Image as Image
+from synalinks.src.backend.pydantic.media import allow_media_root as allow_media_root
 from synalinks.src.backend.pydantic.metrics import FineScore as FineScore
 from synalinks.src.backend.pydantic.metrics import Rating as Rating
 from synalinks.src.backend.pydantic.metrics import Rating10 as Rating10
@@ -199,6 +200,7 @@ from synalinks.src.datasets.mlflow_dataset import MLflowDataset as MLflowDataset
 from synalinks.src.datasets.parquet_dataset import ParquetDataset as ParquetDataset
 from synalinks.src.datasets.text_dataset import TextDataset as TextDataset
 from synalinks.src.datasets.text_dataset import TextDocument as TextDocument
+from synalinks.src.datasets.trace_dataset import TraceDataset as TraceDataset
 from synalinks.src.hooks.monitor import trace_context as trace_context
 from synalinks.src.initializers.initializer import Initializer as Initializer
 from synalinks.src.knowledge_bases.knowledge_base import KnowledgeBase as KnowledgeBase
@@ -359,6 +361,9 @@ from synalinks.src.modules.retrievers.similarity_search import (
 )
 from synalinks.src.modules.synthesis.python_synthesis import (
     PythonSynthesis as PythonSynthesis,
+)
+from synalinks.src.modules.synthesis.sequential_plan_synthesis import (
+    SequentialPlanSynthesis as SequentialPlanSynthesis,
 )
 from synalinks.src.modules.ttc.chain_of_thought import ChainOfThought as ChainOfThought
 from synalinks.src.modules.ttc.self_critique import SelfCritique as SelfCritique

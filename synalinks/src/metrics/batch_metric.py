@@ -29,14 +29,20 @@ class BatchMetric(Metric):
         ``batch_size = k`` so each batch handed to the metric is the ``k``
         samples of a single problem.
 
-    Example:
+    Example (with the concrete `PassAtK` subclass):
 
     ```python
     program.compile(
+        reward=synalinks.rewards.ExactMatch(in_mask=["answer"]),
         metrics=[
-            synalinks.metrics.BatchMetric(),
+            synalinks.metrics.PassAtK(
+                k=5,
+                reward=synalinks.rewards.ExactMatch(in_mask=["answer"]),
+            ),
         ],
     )
+    # batch_size = k samples of one problem
+    await program.evaluate(x=x, y=y, batch_size=5)
     ```
     """
 
@@ -45,6 +51,3 @@ class BatchMetric(Metric):
 
     def result(self):
         raise NotImplementedError
-
-    def _obj_type(self):
-        return "BatchMetric"

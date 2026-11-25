@@ -18,7 +18,8 @@ from synalinks.src.backend.common.op_scope import current_op_scope
 from synalinks.src.backend.common.op_scope import current_trajectory_start
 from synalinks.src.backend.common.op_scope import trajectory_scope
 from synalinks.src.modules.agents.utils.agents_utils import call_tool
-from synalinks.src.modules.agents.utils.agents_utils import discover_agents_md
+from synalinks.src.modules.agents.utils.agents_utils import check_public_tool_name
+from synalinks.src.modules.agents.utils.agents_utils import find_agents_md
 from synalinks.src.modules.agents.utils.agents_utils import merge_tools
 from synalinks.src.modules.agents.utils.agents_utils import resolve_workdir
 from synalinks.src.modules.agents.utils.agents_utils import tool_message_content
@@ -214,35 +215,44 @@ class FunctionCallingAgent(Module):
 
     ```json
     {
-        "query": "How much is 152648 + 485?",
         "messages": [
             {
-            "role": "assistant",
-            "content": "Performing simple addition",
-            "tool_calls": [
-                {
-                    "id": "92a3657c-1a45-46e6-8173-df4255b8423b",
-                    "type": "function",
-                    "function": {
-                        "name": "calculate",
-                        "arguments": "{\"expression\": \"152648 + 485\"}"
+                "role": "assistant",
+                "content": "Performing simple addition",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {
+                            "name": "calculate",
+                            "arguments": "{\"expression\": \"152648 + 485\"}"
                         }
                     }
                 ]
             },
             {
                 "role": "tool",
-                "content": {
-                    "result": 153133.0,
-                    "log": "Successfully executed"
-                },
-                "tool_call_id": "92a3657c-1a45-46e6-8173-df4255b8423b",
+                "content": "{\"result\": 153133.0, \"log\": \"Successfully executed\"}",
+                "tool_call_id": "call_0"
             },
             {
                 "role": "assistant",
-                "content": "The user has asked for a simple addition "
-                "calculation. The assistant used the 'calculate' tool to "
-                "perform this task, and the result was returned successfully.",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": "{\"final_answer\": 153133.0}"
+                        }
+                    }
+                ]
+            },
+            {
+                "role": "tool",
+                "content": "Answer accepted.",
+                "tool_call_id": "call_1"
             }
         ],
         "final_answer": 153133.0
@@ -463,7 +473,7 @@ class FunctionCallingAgent(Module):
             the prompt (Default to False).
         reasoning_effort (string): Optional. The reasoning effort for the LM call
             between ['minimal', 'low', 'medium', 'high', 'disable', 'none', None].
-            Default to None (no reasoning).
+            Default to None (the provider default).
         use_chain_of_thought (bool): Optional. Use chain of thought for tool
             calls generator, usefull when using non-reasoning models. Default False.
         tools (list): The list of `Tool` or MCP tools available to the agent.
@@ -548,15 +558,20 @@ class FunctionCallingAgent(Module):
         self.workdir = resolve_workdir(workdir)
         self.skills = resolve_skills_paths(skills)
 
-        agents_md_items = discover_agents_md(self.workdir) if self.workdir else []
         # root AGENTS.md only: nested files create conflicting instructions
-        agents_md_items = [item for item in agents_md_items if not item.directory]
+        agents_md = find_agents_md(self.workdir) if self.workdir else None
+        try:
+            agents_md = (
+                agents_md
+                and agents_md.read_text(encoding="utf-8", errors="replace").strip()
+            )
+        except OSError:
+            agents_md = None
         # internal, derived at construction; subclasses seed it pre-super
         self.prompt_variables = dict(getattr(self, "_prompt_variables", {}))
-        if agents_md_items:
+        if agents_md:
             self.prompt_variables["custom_instructions"] = [
-                {"directory": item.directory or ".", "content": item.content}
-                for item in agents_md_items
+                {"directory": ".", "content": agents_md}
             ]
 
         if not schema and data_model:
@@ -592,7 +607,17 @@ class FunctionCallingAgent(Module):
         # merged on top, with name-collision and underscore checks.
         self.extra_tools = list(tools) if tools else []
         builtin_tools = list(self._get_builtin_tools())
-        builtin_tools += self._skills_tools(builtin_tools)
+        # `read_skill` makes advertised skills readable; a tool of that name wins.
+        if self.skills:
+            taken = {tool.name for tool in builtin_tools}
+            for extra in self.extra_tools:
+                taken.add(
+                    extra.name
+                    if hasattr(extra, "name")
+                    else getattr(extra, "__name__", "")
+                )
+            if READ_SKILL_TOOL_NAME not in taken:
+                builtin_tools.append(build_read_skill_tool(self.skills))
         merged_tools = merge_tools(
             builtin_tools,
             self.extra_tools,
@@ -602,13 +627,7 @@ class FunctionCallingAgent(Module):
         if not merged_tools and self._requires_tools():
             raise ValueError("You must set the `tools` argument")
         for tool in merged_tools:
-            if tool.name.startswith("_"):
-                raise ValueError(
-                    f"Tool name {tool.name!r} starts with an underscore. "
-                    f"Tools exposed to the LM must have public names; "
-                    f"rename the function or pass an explicit `name=` to "
-                    f"Tool(...)."
-                )
+            check_public_tool_name(tool)
             self.tools[tool.name] = tool
         # With a schema, the answer is a call to this tool (see `_step`).
         self._output_tool_name = None
@@ -672,33 +691,6 @@ class FunctionCallingAgent(Module):
         """
         return []
 
-    def _skills_tools(self, builtin_tools):
-        """The skill-reading built-in, when Agent Skills are configured.
-
-        The ``<available_skills>`` context block lists only names and
-        descriptions; the spec expects the agent to read the bodies through
-        its own file tools, which a tool-calling agent equipped with domain
-        tools does not have — its skills would be advertised but unreadable.
-        So whenever `skills` roots are set, a built-in ``read_skill`` tool is
-        added to complete progressive disclosure (the ``SKILL.md`` body and
-        bundled files, confined to the skill directories).
-
-        Skipped when a tool named ``read_skill`` already exists — a
-        subclass's or the caller's own reader wins over the built-in one.
-        Not serialized: like every built-in it is rebuilt from the `skills`
-        config on reload.
-        """
-        if not self.skills:
-            return []
-        taken = {tool.name for tool in builtin_tools}
-        for extra in self.extra_tools:
-            taken.add(
-                extra.name if hasattr(extra, "name") else getattr(extra, "__name__", "")
-            )
-        if READ_SKILL_TOOL_NAME in taken:
-            return []
-        return [build_read_skill_tool(self.skills)]
-
     def _builtin_tool_kind(self):
         """Short noun naming the built-in tool family, used in collision errors."""
         return "agent"
@@ -751,8 +743,12 @@ class FunctionCallingAgent(Module):
                 agent_messages = trajectory.get("messages")
 
                 if self.autonomous:
-                    return await self._run_autonomous(
-                        trajectory, agent_messages, ctx, training
+                    return await self._run_loop(
+                        trajectory,
+                        agent_messages,
+                        ctx,
+                        training,
+                        max_steps=self.max_iterations,
                     )
                 return await self._run_interactive(
                     trajectory, agent_messages, ctx, training
@@ -813,39 +809,37 @@ class FunctionCallingAgent(Module):
         The base agent runs every call concurrently. Returns True if the loop
         should terminate early (e.g. a submit signal); the base never does.
         """
-        tasks = []
-        tool_calls_ids = []
-        for tool_call in native_tool_calls:
-            function = tool_call.get("function") or {}
-            tool_calls_ids.append(tool_call.get("id"))
-            tasks.append(call_tool(self.tools[function.get("name")], function))
+        for tool_message in await self._run_tool_calls(native_tool_calls):
+            agent_messages.append(tool_message.get_json())
+        return False
 
-        tool_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for j, tool_result in enumerate(tool_results):
-            tool_call_id = tool_calls_ids[j]
+    async def _run_tool_calls(self, tool_calls):
+        """Run ``tool_calls`` concurrently; return one tool `ChatMessage` per
+        call, a failing (or unknown) tool reported as ``error: ...``."""
+        functions = [tool_call.get("function") or {} for tool_call in tool_calls]
+        tool_results = await asyncio.gather(
+            *(call_tool(self.tools.get(f.get("name")), f) for f in functions),
+            return_exceptions=True,
+        )
+        tool_messages = []
+        for tool_call, tool_result in zip(tool_calls, tool_results):
             if isinstance(tool_result, Exception):
-                agent_messages.append(
-                    ChatMessage(
-                        role=ChatRole.TOOL,
-                        tool_call_id=tool_call_id,
-                        content="error: %s" % str(tool_result),
-                    ).get_json()
-                )
+                content = "error: %s" % str(tool_result)
             else:
                 # Handle both JsonDataModel and raw dict results
-                content = (
+                content = tool_message_content(
                     tool_result.get_json()
                     if hasattr(tool_result, "get_json")
                     else tool_result
                 )
-                agent_messages.append(
-                    ChatMessage(
-                        role=ChatRole.TOOL,
-                        tool_call_id=tool_call_id,
-                        content=tool_message_content(content),
-                    ).get_json()
+            tool_messages.append(
+                ChatMessage(
+                    role=ChatRole.TOOL,
+                    tool_call_id=tool_call.get("id"),
+                    content=content,
                 )
-        return False
+            )
+        return tool_messages
 
     def _output_tool_schemas(self):
         """The structured answer as a tool, in OpenAI wire shape (hook):
@@ -962,8 +956,9 @@ class FunctionCallingAgent(Module):
             return ctx["answer"]
         return await self.final_generator(trajectory)
 
-    async def _wrap_final(self, final_result, agent_messages, training):
-        """Wrap the final answer into the agent's return value (shared)."""
+    async def _finish(self, trajectory, agent_messages, ctx, training):
+        """Compute and wrap the final answer after the loop (hook seam)."""
+        final_result = await self._final_result(trajectory, ctx, training)
         if self.schema:
             # With schema: return the structured data model
             if self.return_inputs_with_trajectory:
@@ -998,16 +993,6 @@ class FunctionCallingAgent(Module):
             json=validated_messages.get_json(),
             schema=ChatMessages.get_schema(),
             name=self.name,
-        )
-
-    async def _finish(self, trajectory, agent_messages, ctx, training):
-        """Compute and wrap the final answer after the loop (hook seam)."""
-        final_result = await self._final_result(trajectory, ctx, training)
-        return await self._wrap_final(final_result, agent_messages, training)
-
-    async def _run_autonomous(self, trajectory, agent_messages, ctx, training):
-        return await self._run_loop(
-            trajectory, agent_messages, ctx, training, max_steps=self.max_iterations
         )
 
     async def _run_loop(self, trajectory, agent_messages, ctx, training, *, max_steps):
@@ -1062,36 +1047,8 @@ class FunctionCallingAgent(Module):
 
         if len(agent_messages) > 0:
             if agent_messages[-1].get("role") == ChatRole.ASSISTANT:
-                tasks = []
-                tool_calls_ids = []
-
                 tool_calls = agent_messages[-1].get("tool_calls") or []
-                for tool_call in tool_calls:
-                    function = tool_call.get("function") or {}
-                    tool_calls_ids.append(tool_call.get("id"))
-                    tasks.append(call_tool(self.tools[function.get("name")], function))
-
-                tool_results = await asyncio.gather(*tasks, return_exceptions=True)
-                for j, tool_result in enumerate(tool_results):
-                    tool_call_id = tool_calls_ids[j]
-                    if isinstance(tool_result, Exception):
-                        tool_message = ChatMessage(
-                            role=ChatRole.TOOL,
-                            tool_call_id=tool_call_id,
-                            content="error: %s" % str(tool_result),
-                        )
-                    else:
-                        # Handle both JsonDataModel and raw dict results
-                        content = (
-                            tool_result.get_json()
-                            if hasattr(tool_result, "get_json")
-                            else tool_result
-                        )
-                        tool_message = ChatMessage(
-                            role=ChatRole.TOOL,
-                            tool_call_id=tool_call_id,
-                            content=tool_message_content(content),
-                        )
+                for tool_message in await self._run_tool_calls(tool_calls):
                     agent_messages.append(tool_message.get_json())
                     new_messages.append(tool_message)
 

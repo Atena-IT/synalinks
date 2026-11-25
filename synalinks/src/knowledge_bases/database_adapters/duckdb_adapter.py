@@ -1,3 +1,20 @@
+"""DuckDB database adapter, the default SQL store of `KnowledgeBase`.
+
+DuckDB is an embedded analytical SQL database: a single file (or memory),
+no server. This adapter stores each `DataModel` as a table and adds:
+
+- full-text search: a BM25 index per table (DuckDB's `fts` extension),
+- vector similarity search: an HNSW index on an embedding column (DuckDB's
+  `vss` extension), when the knowledge base has an embedding model,
+- regex search, and hybrid searches fusing full-text or regex with vector
+  similarity (reciprocal rank fusion),
+- raw SQL through `sql()`, `SELECT`-only by default,
+- optional at-rest encryption (`encryption_key`).
+
+The connection is locked down against external I/O, so a query cannot read
+or write host files (`read_csv('/etc/passwd')`, `COPY ... TO`).
+"""
+
 import heapq
 import os
 import warnings
@@ -16,9 +33,11 @@ from synalinks.src.backend import EmbeddingRequest
 from synalinks.src.backend import JsonDataModel
 from synalinks.src.backend import SymbolicDataModel
 from synalinks.src.knowledge_bases.adapters_utils import format_search_results
+from synalinks.src.knowledge_bases.adapters_utils import json_columns
 from synalinks.src.knowledge_bases.adapters_utils import minmax_normalize_scores
 from synalinks.src.knowledge_bases.adapters_utils import normalize_query_vectors
 from synalinks.src.knowledge_bases.adapters_utils import resolve_db_path
+from synalinks.src.knowledge_bases.adapters_utils import resolve_ref
 from synalinks.src.knowledge_bases.adapters_utils import sanitize_identifier
 from synalinks.src.knowledge_bases.adapters_utils import to_pascal_identifier
 from synalinks.src.knowledge_bases.adapters_utils import to_snake_identifier
@@ -82,21 +101,6 @@ _VSS_DISTANCE_FN = {
 MAIN_TABLE = "main"
 
 
-def _get_json_columns_from_schema(schema: dict) -> set:
-    """Get column names that are JSON type from a JSON schema."""
-    json_columns = set()
-    properties = schema.get("properties", {})
-    for prop_name, prop_spec in properties.items():
-        prop_type = prop_spec.get("type")
-        if prop_type == "object":
-            json_columns.add(prop_name)
-        elif prop_type == "array":
-            item_spec = prop_spec.get("items", {})
-            if item_spec.get("type") == "object":
-                json_columns.add(prop_name)
-    return json_columns
-
-
 def _parse_json_columns(row: dict, json_columns: set) -> dict:
     """Parse JSON string columns to Python dicts based on known JSON columns."""
     result = dict(row)
@@ -116,7 +120,7 @@ table_identifier = to_pascal_identifier
 column_identifier = to_snake_identifier
 
 
-def sanitize_properties(properties: dict):
+def sanitize_column_names(properties: dict):
     """Sanitize and snake_case-normalize dict keys before SQL interpolation."""
     return {column_identifier(k): v for k, v in properties.items()}
 
@@ -125,6 +129,47 @@ _ATTACH_ALIAS = "kb"
 
 
 class DuckDBAdapter(DatabaseAdapter):
+    """DuckDB-backed implementation of `DatabaseAdapter`.
+
+    You don't create it directly: a `KnowledgeBase` uses it for a
+    `duckdb://` URI (or no URI) and forwards its arguments.
+
+    Example:
+
+    ```python
+    import synalinks
+
+    class Document(synalinks.DataModel):
+        id: str = synalinks.Field(description="The document id")
+        title: str = synalinks.Field(description="The document title")
+        content: str = synalinks.Field(description="The document content")
+
+    knowledge_base = synalinks.KnowledgeBase(
+        uri="duckdb://./documents.db",  # "duckdb://:memory:" for tests
+        data_models=[Document],
+        embedding_model=synalinks.EmbeddingModel(model="ollama/mxbai-embed-large"),
+    )
+
+    await knowledge_base.update(
+        [
+            Document(id="1", title="Paris", content="Paris is the capital of France."),
+            Document(id="2", title="Rome", content="Rome is the capital of Italy."),
+        ]
+    )
+
+    # BM25 full-text and vector similarity, fused by reciprocal rank
+    results = await knowledge_base.hybrid_fts_search(
+        "capital of France", table_name="Document", k=5
+    )
+
+    # Or plain SQL (SELECT-only by default)
+    rows = await knowledge_base.sql("SELECT title FROM Document")
+    ```
+
+    Without an embedding model, similarity search needs explicit vectors
+    (`vector_or_vectors=`) and hybrid search uses full-text only.
+    """
+
     def __init__(
         self,
         uri=None,
@@ -141,13 +186,57 @@ class DuckDBAdapter(DatabaseAdapter):
         M=None,
         M0=None,
         vss_key=VSS_KEY,
-        main_table=MAIN_TABLE,
         vector_dim=None,
         wipe_on_start=False,
         name=None,
         encryption_key=None,
         **kwargs,
     ):
+        """Initialize the DuckDB adapter.
+
+        Args:
+            uri (str): `duckdb://<path>` (file-backed) or `duckdb://:memory:`
+                (in-memory). When omitted, resolves to
+                `{synalinks_home()}/{name or 'database'}.db`.
+            embedding_model (EmbeddingModel): Optional. Enables vector
+                similarity search (and the vector half of hybrid search),
+                by adding an embedding column
+                and an HNSW index to each table.
+            data_models (list): The `DataModel` classes to create tables
+                for (one table per model, named after its schema `title`).
+                When omitted, the tables already in the database are used.
+            stemmer (str): Stemmer of the full-text index: a language
+                (`"english"`, `"french"`, ...), `"porter"` (default) or
+                `"none"`.
+            stopwords (str): Stopwords of the full-text index: `"english"`,
+                `"none"`, or the name of a table of stopwords. `None` keeps
+                DuckDB's default (`"english"`).
+            ignore (str): Regular expression of the characters the
+                full-text index ignores. `None` keeps DuckDB's default.
+            strip_accents (bool): Whether the full-text index strips
+                accents. `None` keeps DuckDB's default (`True`).
+            lower (bool): Whether the full-text index lowercases text.
+                `None` keeps DuckDB's default (`True`).
+            metric (str): Vector distance: `"cosine"` (default), `"l2sq"`
+                (squared Euclidean) or `"ip"` (inner product).
+            ef_construction (int): HNSW build-time candidate list size.
+                `None` keeps DuckDB's default.
+            ef_search (int): HNSW search-time candidate list size. `None`
+                keeps DuckDB's default.
+            M (int): HNSW maximum neighbors per node. `None` keeps DuckDB's
+                default.
+            M0 (int): HNSW maximum neighbors on the base layer. `None` keeps
+                DuckDB's default.
+            vss_key (str): Name of the embedding column. Defaults to
+                `"embedding"`.
+            vector_dim (int): Embedding dimension. Inferred from the
+                embedding model on the first write when omitted.
+            wipe_on_start (bool): Whether to clear the database on init.
+                Defaults to `False`.
+            name (str): Optional adapter name, also the default file stem.
+            encryption_key (str): Optional key to encrypt the database file
+                at rest. Never serialized with the adapter's config.
+        """
         # Resolve URI → backing path. ``None`` defaults to
         # ``{synalinks_home()}/{name or 'database'}.db`` so a no-args
         # KnowledgeBase() persists across processes. The helper also
@@ -270,27 +359,6 @@ class DuckDBAdapter(DatabaseAdapter):
             return con
         return duckdb.connect(self.uri, read_only=False)
 
-    def _open_loose_connection(self):
-        """Open a fresh, NON-sandboxed connection for native bulk loads.
-
-        ``read_csv`` / ``read_parquet`` need ``enable_external_access=true``,
-        which the sandboxed persistent connection has permanently disabled.
-        """
-        if self._encryption_key is not None:
-            con = duckdb.connect(":memory:")
-            self._attach_db(con)
-            con.execute(f"USE {_ATTACH_ALIAS}")
-        else:
-            con = duckdb.connect(self.uri, read_only=False)
-        try:
-            con.execute("LOAD fts;")
-            if self.embedding_model:
-                con.execute("LOAD vss;")
-                con.execute("SET hnsw_enable_experimental_persistence=true;")
-        except duckdb.Error:
-            pass
-        return con
-
     @contextmanager
     def _connect(self, read_only=False):
         """Yield the adapter's cached connection.
@@ -404,13 +472,6 @@ class DuckDBAdapter(DatabaseAdapter):
                 except Exception as e:
                     raise RuntimeError(f"Failed to drop table {table_name}: {e}")
 
-    def _get_id_key(self, schema: dict) -> str:
-        """Return the first schema property (snake-cased, sanitized) as primary key."""
-        props = schema.get("properties") if isinstance(schema, dict) else None
-        if not props:
-            raise ValueError("Cannot determine primary key: schema has no `properties`.")
-        return column_identifier(next(iter(props.keys())))
-
     def _has_indexable_text_columns(self, schema: dict) -> bool:
         """Return ``True`` if the schema has at least one VARCHAR column
         besides the primary key. Used to gate FTS index creation and
@@ -519,13 +580,7 @@ class DuckDBAdapter(DatabaseAdapter):
         for prop_name, prop_spec in properties.items():
             prop_name = column_identifier(prop_name)
 
-            # Resolve Pydantic v2 $ref for enums / nested models.
-            if "$ref" in prop_spec:
-                ref_name = prop_spec["$ref"].rsplit("/", 1)[-1]
-                if ref_name in defs:
-                    resolved = dict(defs[ref_name])
-                    resolved.update({k: v for k, v in prop_spec.items() if k != "$ref"})
-                    prop_spec = resolved
+            prop_spec = resolve_ref(prop_spec, defs)
 
             prop_type = prop_spec.get("type")
 
@@ -534,10 +589,7 @@ class DuckDBAdapter(DatabaseAdapter):
 
             if not prop_type and "anyOf" in prop_spec:
                 for variant in prop_spec["anyOf"]:
-                    if "$ref" in variant:
-                        ref_name = variant["$ref"].rsplit("/", 1)[-1]
-                        if ref_name in defs:
-                            variant = defs[ref_name]
+                    variant = resolve_ref(variant, defs)
                     vtype = variant.get("type")
                     if vtype and vtype != "null":
                         prop_type = vtype
@@ -746,29 +798,6 @@ class DuckDBAdapter(DatabaseAdapter):
             return str(value)
         return "'" + str(value).replace("'", "''") + "'"
 
-    def _fts_index_options(self, overwrite: bool) -> str:
-        """Render the optional kwargs for ``PRAGMA create_fts_index``.
-
-        Only adapter init values that were explicitly supplied (i.e.
-        not ``None``) get serialized; DuckDB picks its own defaults
-        otherwise, so this avoids hard-coding upstream defaults
-        (``stopwords='english'``, ``strip_accents=1`` etc.) into the
-        adapter. ``overwrite`` is always emitted because callers pass
-        an explicit ``True`` / ``False`` per rebuild.
-        """
-        opts: List[str] = [f"stemmer='{self.stemmer}'"]
-        for key, value in (
-            ("stopwords", self.stopwords),
-            ("ignore", self.ignore),
-            ("strip_accents", self.strip_accents),
-            ("lower", self.lower),
-        ):
-            if value is None:
-                continue
-            opts.append(f"{key}={self._render_sql_literal(value)}")
-        opts.append(f"overwrite={1 if overwrite else 0}")
-        return ", ".join(opts)
-
     def _maybe_create_fulltext_index(
         self,
         data_model: Union[JsonDataModel, SymbolicDataModel],
@@ -781,15 +810,25 @@ class DuckDBAdapter(DatabaseAdapter):
 
             if not self._has_indexable_text_columns(json_schema):
                 return
-            # '*' tells DuckDB to index every VARCHAR column (the id
-            # column is excluded by the pragma itself), so callers
-            # don't need a whitelist of "searchable" field names.
+            # Only the options set on the adapter are rendered: DuckDB defaults
+            # the rest (stopwords, accents...). '*' indexes every VARCHAR
+            # column (the pragma itself excludes the id column).
+            options = [f"stemmer='{self.stemmer}'"]
+            for key, value in (
+                ("stopwords", self.stopwords),
+                ("ignore", self.ignore),
+                ("strip_accents", self.strip_accents),
+                ("lower", self.lower),
+            ):
+                if value is not None:
+                    options.append(f"{key}={self._render_sql_literal(value)}")
+            options.append(f"overwrite={1 if overwrite else 0}")
             con.execute(f"""
                 PRAGMA create_fts_index(
                     'main.{table_name}',
                     '{id_key}',
                     '*',
-                    {self._fts_index_options(overwrite)}
+                    {", ".join(options)}
                 );
             """)
 
@@ -876,7 +915,7 @@ class DuckDBAdapter(DatabaseAdapter):
 
             schema = data_model.get_schema()
             table = table_identifier(schema["title"])
-            json_data = sanitize_properties(data_model.get_json())
+            json_data = sanitize_column_names(data_model.get_json())
             id_key = self._get_id_key(schema)
 
             id_val = json_data.get(id_key)
@@ -1110,8 +1149,10 @@ class DuckDBAdapter(DatabaseAdapter):
         """Native DuckDB bulk load shared by the ``from_csv`` / ``from_parquet``
         / ``from_json`` / ``from_jsonl`` helpers.
 
-        Cycles the sandboxed connection out for a loose one because
-        ``read_*`` table functions need ``enable_external_access=true``.
+        The file is read on a throwaway in-memory connection (``read_*``
+        table functions need ``enable_external_access=true``, which the
+        sandboxed connection has off for good) and streamed as Arrow into
+        the main connection, so in-memory databases keep their data.
         """
         if not os.path.exists(path):
             raise FileNotFoundError(f"File not found: {path}")
@@ -1135,62 +1176,53 @@ class DuckDBAdapter(DatabaseAdapter):
             reader_extras = ""
         reader_sql = f"{reader_fn}(?{reader_extras})"
 
-        self._con.close()
-        self._con = None
+        loose = duckdb.connect(":memory:")
         try:
-            loose = self._open_loose_connection()
-            try:
-                desc_rows = loose.execute(
-                    f"DESCRIBE SELECT * FROM {reader_sql}",
-                    [path],
-                ).fetchall()
-                if not desc_rows:
-                    raise ValueError(f"{path}: no columns detected in source file.")
+            source = loose.sql(f"SELECT * FROM {reader_sql}", params=[path])
+            if not source.columns:
+                raise ValueError(f"{path}: no columns detected in source file.")
 
-                # orig_col_names quote-survive header values; db_col_names
-                # are snake_cased. INSERT maps positionally between them.
-                col_defs = []
-                orig_col_names = []
-                db_col_names = []
-                for i, row in enumerate(desc_rows):
-                    orig_name = row[0]
-                    db_name = column_identifier(orig_name)
-                    orig_col_names.append(orig_name)
-                    db_col_names.append(db_name)
-                    col_type = row[1]
-                    if i == 0:
-                        col_defs.append(f"{db_name} {col_type} PRIMARY KEY")
-                    else:
-                        col_defs.append(f"{db_name} {col_type}")
-                pk_col = db_col_names[0]
-
-                loose.execute(
-                    f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(col_defs)})"
-                )
-
-                update_cols = [c for c in db_col_names if c != pk_col]
-                if update_cols:
-                    update_sql = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
-                    conflict_clause = f"ON CONFLICT ({pk_col}) DO UPDATE SET {update_sql}"
+            # orig_col_names quote-survive header values; db_col_names
+            # are snake_cased. INSERT maps positionally between them.
+            col_defs = []
+            orig_col_names = []
+            db_col_names = []
+            for i, (orig_name, col_type) in enumerate(zip(source.columns, source.types)):
+                db_name = column_identifier(orig_name)
+                orig_col_names.append(orig_name)
+                db_col_names.append(db_name)
+                if i == 0:
+                    col_defs.append(f"{db_name} {col_type} PRIMARY KEY")
                 else:
-                    conflict_clause = f"ON CONFLICT ({pk_col}) DO NOTHING"
+                    col_defs.append(f"{db_name} {col_type}")
+            pk_col = db_col_names[0]
 
-                def _quote_src(c):
-                    return '"' + c.replace('"', '""') + '"'
+            self._con.execute(
+                f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(col_defs)})"
+            )
 
-                select_list = ", ".join(_quote_src(c) for c in orig_col_names)
-                insert_col_list = ", ".join(db_col_names)
-                loose.execute(
+            update_cols = [c for c in db_col_names if c != pk_col]
+            if update_cols:
+                update_sql = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+                conflict_clause = f"ON CONFLICT ({pk_col}) DO UPDATE SET {update_sql}"
+            else:
+                conflict_clause = f"ON CONFLICT ({pk_col}) DO NOTHING"
+
+            select_list = ", ".join(
+                '"' + c.replace('"', '""') + '"' for c in orig_col_names
+            )
+            insert_col_list = ", ".join(db_col_names)
+            self._con.register("_bulk_load_source", source.to_arrow_reader())
+            try:
+                self._con.execute(
                     f"INSERT INTO {table_name} ({insert_col_list}) "
-                    f"SELECT {select_list} FROM {reader_sql} "
-                    f"{conflict_clause}",
-                    [path],
+                    f"SELECT {select_list} FROM _bulk_load_source "
+                    f"{conflict_clause}"
                 )
             finally:
-                loose.close()
+                self._con.unregister("_bulk_load_source")
         finally:
-            self._con = self._open_main_connection()
-            self._sandbox(self._con)
+            loose.close()
 
         schema = self._duckdb_table_to_json_schema(table_name)
         schema["title"] = table_name
@@ -1370,14 +1402,14 @@ class DuckDBAdapter(DatabaseAdapter):
             if not rows:
                 return None if return_single else results
 
-            json_columns = _get_json_columns_from_schema(json_schema)
+            json_cols = json_columns(json_schema)
             rows_by_id = {row[id_key]: row for row in rows}
 
             for idx, id_val in enumerate(ids):
                 row = rows_by_id.get(id_val)
                 if row is None:
                     continue
-                json_data = _parse_json_columns(row, json_columns)
+                json_data = _parse_json_columns(row, json_cols)
                 if remove_embedding and self.vss_key in json_data:
                     json_data.pop(self.vss_key)
                 results[idx] = JsonDataModel(
@@ -1429,11 +1461,11 @@ class DuckDBAdapter(DatabaseAdapter):
             if not rows:
                 return []
 
-            json_columns = _get_json_columns_from_schema(json_schema)
+            json_cols = json_columns(json_schema)
 
             results = []
             for row in rows:
-                json_data = _parse_json_columns(row, json_columns)
+                json_data = _parse_json_columns(row, json_cols)
                 if remove_embedding and self.vss_key in json_data:
                     json_data.pop(self.vss_key)
                 results.append(
@@ -1725,35 +1757,6 @@ class DuckDBAdapter(DatabaseAdapter):
         ranked = sorted(results.values(), key=lambda r: r["score"])[:k]
         return format_search_results(ranked, output_format)
 
-    def _bm25_call(
-        self,
-        id_key: str,
-        *,
-        bm25_b: Optional[float] = None,
-        bm25_k: Optional[float] = None,
-        conjunctive: Optional[bool] = None,
-    ) -> str:
-        """Render a ``match_bm25(id, ?[, named-args])`` call fragment.
-
-        The ``?`` placeholder is reserved for the query string (bound
-        as a parameter by the caller). BM25 tuning knobs (``b``,
-        ``k``, ``conjunctive``) are inlined via DuckDB's ``key := value``
-        named-argument syntax so we don't have to specify the
-        positional args we want to leave at the engine default. Only
-        non-``None`` overrides are emitted.
-        """
-        extras: List[str] = []
-        for key, value in (
-            ("k", bm25_k),
-            ("b", bm25_b),
-            ("conjunctive", conjunctive),
-        ):
-            if value is None:
-                continue
-            extras.append(f"{key} := {self._render_sql_literal(value)}")
-        suffix = (", " + ", ".join(extras)) if extras else ""
-        return f"match_bm25({id_key}, ?{suffix})"
-
     async def fulltext_search(
         self,
         text_or_texts: Union[str, List[str]],
@@ -1803,16 +1806,19 @@ class DuckDBAdapter(DatabaseAdapter):
             warnings.warn(f"Skipping FTS search for {label}: no text columns to index.")
             return format_search_results([], output_format)
         fts_table = sanitize_identifier(f"fts_main_{label}")
-        # Build the BM25 call once; the named-arg fragments (b/k/
-        # conjunctive) are inlined as literals, leaving the ``?`` for
-        # the query string bound per iteration. ``conjunctive=False``
-        # is DuckDB's default, so only ``True`` triggers an override.
-        bm25_call = self._bm25_call(
-            id_key,
-            bm25_b=bm25_b,
-            bm25_k=bm25_k,
-            conjunctive=conjunctive or None,
+        # `match_bm25(id, ?[, key := value])`: the `?` is the query, bound per
+        # iteration; only the overrides given are rendered (DuckDB defaults
+        # the rest), and `conjunctive=False` is DuckDB's default already.
+        overrides = "".join(
+            f", {key} := {self._render_sql_literal(value)}"
+            for key, value in (
+                ("k", bm25_k),
+                ("b", bm25_b),
+                ("conjunctive", conjunctive or None),
+            )
+            if value is not None
         )
+        bm25_call = f"match_bm25({id_key}, ?{overrides})"
 
         sql = f"""
             SELECT t.*, fts.score
@@ -1832,7 +1838,9 @@ class DuckDBAdapter(DatabaseAdapter):
         # rescale to [0, 1] so scores are comparable with the LanceDB adapter.
         results: Dict[Any, Dict[str, Any]] = {}
         with self._connect(read_only=True) as con:
-            for text in texts:
+            # An empty table has no FTS index yet (built on first insert).
+            has_rows = con.execute(f"SELECT COUNT(*) FROM {label}").fetchall()[0][0]
+            for text in texts if has_rows else []:
                 try:
                     rows = con.sql(sql, params=[text, k]).to_arrow_table().to_pylist()
                 except Exception as e:

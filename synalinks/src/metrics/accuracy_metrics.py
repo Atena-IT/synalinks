@@ -5,13 +5,14 @@ from typing import List
 from typing import Optional
 
 from synalinks.src import backend
-from synalinks.src import ops
 from synalinks.src import tree
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend import DataModel
 from synalinks.src.backend.common import numpy as np
 from synalinks.src.metrics.metric import Metric
+from synalinks.src.metrics.metric import apply_masks
 from synalinks.src.metrics.metric import ragged_add
+from synalinks.src.metrics.metrics_utils import aggregate_scores
 from synalinks.src.utils import nlp_utils
 
 
@@ -36,7 +37,8 @@ class Accuracy(Metric):
 
     If `y_true` and `y_pred` contain multiple fields the JSON object's
     fields are flattened and the score computed for each one
-    independently before being averaged.
+    independently, then reduced
+    according to `average` (a list of per-field scores by default).
 
 
     Example:
@@ -44,7 +46,7 @@ class Accuracy(Metric):
     ```python
     program.compile(
         metrics=[
-            synalinks.metrics.Accuracy(),
+            synalinks.metrics.Accuracy(average="macro"),
         ],
     )
     ```
@@ -106,50 +108,24 @@ class Accuracy(Metric):
             self.axis = 0
 
     async def update_state(self, y_true, y_pred):
-        y_pred = tree.map_structure(lambda x: ops.convert_to_json_data_model(x), y_pred)
-        y_true = tree.map_structure(lambda x: ops.convert_to_json_data_model(x), y_true)
+        y_true, y_pred = apply_masks(
+            y_true,
+            y_pred,
+            in_mask=self.in_mask,
+            in_mask_pattern=self.in_mask_pattern,
+            out_mask=self.out_mask,
+            out_mask_pattern=self.out_mask_pattern,
+        )
 
-        if self.in_mask or self.in_mask_pattern:
-            y_pred = tree.map_structure(
-                lambda x: (
-                    x.in_mask(mask=self.in_mask, pattern=self.in_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_pred,
-            )
-            y_true = tree.map_structure(
-                lambda x: (
-                    x.in_mask(mask=self.in_mask, pattern=self.in_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_true,
-            )
-        if self.out_mask or self.out_mask_pattern:
-            y_pred = tree.map_structure(
-                lambda x: (
-                    x.out_mask(mask=self.out_mask, pattern=self.out_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_pred,
-            )
-            y_true = tree.map_structure(
-                lambda x: (
-                    x.out_mask(mask=self.out_mask, pattern=self.out_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_true,
-            )
-
-        if y_true is None or y_pred is None:
-            # A failed prediction yields `y_pred is None`; there is nothing to
-            # compare, so skip the sample instead of calling `.get_json()` on None.
+        if y_true is None:
             return
         y_true = tree.flatten(tree.map_structure(lambda x: str(x), y_true.get_json()))
-        y_pred = tree.flatten(tree.map_structure(lambda x: str(x), y_pred.get_json()))
+        # A failed prediction (`y_pred is None`) scores as an empty one.
+        y_pred = (
+            []
+            if y_pred is None
+            else tree.flatten(tree.map_structure(lambda x: str(x), y_pred.get_json()))
+        )
 
         correct = []
         total = []
@@ -207,26 +183,9 @@ class Accuracy(Metric):
             total = np.sum(total)
 
         score = np.divide(correct, np.add(total, backend.epsilon()))
-        return self._aggregate(score)
-
-    def _aggregate(self, score):
-        """Apply `average` reduction over per-field scores."""
-        score = np.convert_to_tensor(score)
-        if self.average == "weighted":
-            intermediate_weights = self.state.get("intermediate_weights")
-            weights = np.divide(
-                intermediate_weights,
-                np.sum(intermediate_weights) + backend.epsilon(),
-            )
-            score = np.sum(score * weights)
-        elif self.average is not None:  # [micro, macro]
-            score = np.mean(score, self.axis)
-        # numpy 1.25+ deprecates float() on a >0-D array even when size == 1,
-        # so go through .item() / .tolist() to always hand back Python scalars.
-        score_arr = np.convert_to_numpy(score)
-        if score_arr.size == 1:
-            return float(score_arr.item())
-        return [float(v) for v in score_arr.tolist()]
+        return aggregate_scores(
+            score, self.average, self.axis, self.state.get("intermediate_weights")
+        )
 
     def get_config(self):
         """Return the serializable config of the metric.
@@ -358,43 +317,14 @@ class BinaryAccuracy(Accuracy):
         self.threshold = threshold
 
     async def update_state(self, y_true, y_pred):
-        y_pred = tree.map_structure(lambda x: ops.convert_to_json_data_model(x), y_pred)
-        y_true = tree.map_structure(lambda x: ops.convert_to_json_data_model(x), y_true)
-
-        if self.in_mask or self.in_mask_pattern:
-            y_pred = tree.map_structure(
-                lambda x: (
-                    x.in_mask(mask=self.in_mask, pattern=self.in_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_pred,
-            )
-            y_true = tree.map_structure(
-                lambda x: (
-                    x.in_mask(mask=self.in_mask, pattern=self.in_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_true,
-            )
-        if self.out_mask or self.out_mask_pattern:
-            y_pred = tree.map_structure(
-                lambda x: (
-                    x.out_mask(mask=self.out_mask, pattern=self.out_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_pred,
-            )
-            y_true = tree.map_structure(
-                lambda x: (
-                    x.out_mask(mask=self.out_mask, pattern=self.out_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_true,
-            )
+        y_true, y_pred = apply_masks(
+            y_true,
+            y_pred,
+            in_mask=self.in_mask,
+            in_mask_pattern=self.in_mask_pattern,
+            out_mask=self.out_mask,
+            out_mask_pattern=self.out_mask_pattern,
+        )
 
         def convert_to_binary(x):
             if isinstance(x, bool):
@@ -407,15 +337,18 @@ class BinaryAccuracy(Accuracy):
                     "Use `in_mask` or `out_mask` to remove the other fields."
                 )
 
-        if y_true is None or y_pred is None:
-            # A failed prediction yields `y_pred is None`; there is nothing to
-            # compare, so skip the sample instead of calling `.get_json()` on None.
+        if y_true is None:
             return
         y_true = tree.flatten(
             tree.map_structure(lambda x: convert_to_binary(x), y_true.get_json())
         )
-        y_pred = tree.flatten(
-            tree.map_structure(lambda x: convert_to_binary(x), y_pred.get_json())
+        # A failed prediction (`y_pred is None`) scores as an empty one.
+        y_pred = (
+            []
+            if y_pred is None
+            else tree.flatten(
+                tree.map_structure(lambda x: convert_to_binary(x), y_pred.get_json())
+            )
         )
         y_true = np.convert_to_tensor(y_true)
         y_pred = np.convert_to_tensor(y_pred)
@@ -583,50 +516,24 @@ class CategoricalAccuracy(Accuracy):
         self.labels = labels
 
     async def update_state(self, y_true, y_pred):
-        y_pred = tree.map_structure(lambda x: ops.convert_to_json_data_model(x), y_pred)
-        y_true = tree.map_structure(lambda x: ops.convert_to_json_data_model(x), y_true)
+        y_true, y_pred = apply_masks(
+            y_true,
+            y_pred,
+            in_mask=self.in_mask,
+            in_mask_pattern=self.in_mask_pattern,
+            out_mask=self.out_mask,
+            out_mask_pattern=self.out_mask_pattern,
+        )
 
-        if self.in_mask or self.in_mask_pattern:
-            y_pred = tree.map_structure(
-                lambda x: (
-                    x.in_mask(mask=self.in_mask, pattern=self.in_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_pred,
-            )
-            y_true = tree.map_structure(
-                lambda x: (
-                    x.in_mask(mask=self.in_mask, pattern=self.in_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_true,
-            )
-        if self.out_mask or self.out_mask_pattern:
-            y_pred = tree.map_structure(
-                lambda x: (
-                    x.out_mask(mask=self.out_mask, pattern=self.out_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_pred,
-            )
-            y_true = tree.map_structure(
-                lambda x: (
-                    x.out_mask(mask=self.out_mask, pattern=self.out_mask_pattern)
-                    if x is not None
-                    else x
-                ),
-                y_true,
-            )
-
-        if y_true is None or y_pred is None:
-            # A failed prediction yields `y_pred is None`; there is nothing to
-            # compare, so skip the sample instead of calling `.get_json()` on None.
+        if y_true is None:
             return
         y_true = tree.flatten(tree.map_structure(lambda x: x, y_true.get_json()))
-        y_pred = tree.flatten(tree.map_structure(lambda x: x, y_pred.get_json()))
+        # A failed prediction (`y_pred is None`) scores as an empty one.
+        y_pred = (
+            []
+            if y_pred is None
+            else tree.flatten(tree.map_structure(lambda x: x, y_pred.get_json()))
+        )
 
         correct = []
         total = []

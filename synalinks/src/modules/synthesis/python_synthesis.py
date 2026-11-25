@@ -202,7 +202,7 @@ class PythonSynthesis(Module):
             data_model=synalinks.datasets.arcagi.get_input_data_model(),
         )
         outputs = await synalinks.PythonSynthesis(
-            data_model=synalinks.datasets.arcagi.get_output_data_model()
+            data_model=synalinks.datasets.arcagi.get_output_data_model(),
             python_script=default_python_script,
             default_return_value={"output_grid": [[]]},
         )(inputs)
@@ -213,6 +213,8 @@ class PythonSynthesis(Module):
             name="python_script_synthesis",
             description="A program to solve ARCAGI with python code",
         )
+
+    asyncio.run(main())
     ```
     
     Args:
@@ -429,50 +431,15 @@ class PythonSynthesis(Module):
                             "reward": None,
                         }
                     )
-        if result:
-            if self.return_python_script:
-                return JsonDataModel(
-                    json={
-                        "python_script": python_script,
-                        **result,
-                        "stdout": stdout,
-                        "stderr": stderr,
-                    },
-                    schema=self.schema,
-                    name=self.name,
-                )
-            else:
-                return JsonDataModel(
-                    json={
-                        **result,
-                        "stdout": stdout,
-                        "stderr": stderr,
-                    },
-                    schema=self.schema,
-                    name=self.name,
-                )
-        else:
-            if self.return_python_script:
-                return JsonDataModel(
-                    json={
-                        "python_script": python_script,
-                        **self.default_return_value,
-                        "stdout": stdout,
-                        "stderr": stderr,
-                    },
-                    schema=self.schema,
-                    name=self.name,
-                )
-            else:
-                return JsonDataModel(
-                    json={
-                        **self.default_return_value,
-                        "stdout": stdout,
-                        "stderr": stderr,
-                    },
-                    schema=self.schema,
-                    name=self.name,
-                )
+        json = {
+            **(result or self.default_return_value),
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+        if self.return_python_script:
+            json = {"python_script": python_script, **json}
+        outputs = await self.compute_output_spec(inputs)
+        return JsonDataModel(json=json, schema=outputs.get_schema(), name=self.name)
 
     async def compute_output_spec(self, inputs, training=False, sandbox=None):
         if self.return_python_script:

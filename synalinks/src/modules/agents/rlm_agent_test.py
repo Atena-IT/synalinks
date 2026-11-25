@@ -9,6 +9,7 @@ from synalinks.src import testing
 from synalinks.src.backend import ChatMessages
 from synalinks.src.backend import DataModel
 from synalinks.src.modules.agents.rlm_agent import RecursiveLanguageModelAgent
+from synalinks.src.modules.agents.rlm_agent import get_sandbox_functions_guidance
 from synalinks.src.modules.core.input_module import Input
 from synalinks.src.modules.core.tool import Tool
 from synalinks.src.modules.language_models import LanguageModel
@@ -750,6 +751,7 @@ class RecursiveLanguageModelAgentTest(testing.TestCase):
             language_model=primary,
             sub_language_model=cheap,
             max_llm_calls=7,
+            native_tools=[Tool(cube)],
         )
         config = agent.get_config()
         self.assertEqual(config["max_llm_calls"], 7)
@@ -757,6 +759,7 @@ class RecursiveLanguageModelAgentTest(testing.TestCase):
         restored = RecursiveLanguageModelAgent.from_config(config)
         self.assertEqual(restored.max_llm_calls, 7)
         self.assertEqual(restored.sub_language_model.model, "ollama_chat/llama3")
+        self.assertEqual(list(restored.native_tools), ["cube"])
 
 
 class RLMFinalGeneratorAlwaysBuiltTest(testing.TestCase):
@@ -997,3 +1000,19 @@ class RLMSubagentTest(testing.TestCase):
         self.assertEqual(set(Sandbox.live_sandboxes) - live, set())
         sandbox.merge(branch, repl=True)
         self.assertIn("7", "".join((await sandbox.run_code("print(subvar)")).logs.stdout))
+
+
+class OptionalParamStubTest(testing.TestCase):
+    def test_optional_param_renders_as_a_plain_union(self):
+        async def search(query: str, k: int | None = None):
+            """Search.
+
+            Args:
+                query (str): The query.
+                k (int | None): How many results.
+            """
+            return {}
+
+        guidance = get_sandbox_functions_guidance(None, [Tool(search)])
+        self.assertIn("k: int | None = None", guidance)
+        self.assertNotIn("Must match this JSON schema", guidance)

@@ -2,8 +2,8 @@
 
 from synalinks.src import ops
 from synalinks.src.api_export import synalinks_export
+from synalinks.src.metrics.metric import apply_masks
 from synalinks.src.rewards.reward import Reward
-from synalinks.src.rewards.reward import apply_masks
 from synalinks.src.rewards.reward import check_async_reward_fn
 from synalinks.src.rewards.reward import reduce_values
 from synalinks.src.saving import serialization_lib
@@ -63,13 +63,28 @@ class BatchReward(Reward):
                 out_mask_pattern=self.out_mask_pattern,
             )
             rewards = await self.call(y_true, y_pred)
-            return _validate_batch_rewards(rewards, y_pred, type(self).__name__)
+            cls_name = type(self).__name__
+            if isinstance(rewards, (list, tuple)):
+                pass
+            elif hasattr(rewards, "__iter__") and not isinstance(
+                rewards, (str, bytes, dict)
+            ):
+                # Accept numpy arrays / generators / other iterables of floats.
+                rewards = list(rewards)
+            else:
+                raise TypeError(
+                    f"`{cls_name}.call` must return a list of per-sample floats. "
+                    f"Got {type(rewards).__name__}."
+                )
+            if hasattr(y_pred, "__len__") and len(rewards) != len(y_pred):
+                raise ValueError(
+                    f"`{cls_name}.call` returned {len(rewards)} rewards but the "
+                    f"batch has {len(y_pred)} samples; they must match."
+                )
+            return [float(r) for r in rewards]
 
     async def call(self, y_true, y_pred):
         raise NotImplementedError
-
-    def _obj_type(self):
-        return "BatchReward"
 
 
 @synalinks_export("synalinks.rewards.BatchRewardFunctionWrapper")
@@ -159,22 +174,3 @@ class BatchRewardFunctionWrapper(BatchReward):
 
     def __repr__(self):
         return f"<BatchRewardFunctionWrapper({self.fn}, kwargs={self._fn_kwargs})>"
-
-
-def _validate_batch_rewards(rewards, y_pred, cls_name):
-    if isinstance(rewards, (list, tuple)):
-        pass
-    elif hasattr(rewards, "__iter__") and not isinstance(rewards, (str, bytes, dict)):
-        # Accept numpy arrays / generators / other iterables of floats.
-        rewards = list(rewards)
-    else:
-        raise TypeError(
-            f"`{cls_name}.call` must return a list of per-sample floats. "
-            f"Got {type(rewards).__name__}."
-        )
-    if hasattr(y_pred, "__len__") and len(rewards) != len(y_pred):
-        raise ValueError(
-            f"`{cls_name}.call` returned {len(rewards)} rewards but the "
-            f"batch has {len(y_pred)} samples; they must match."
-        )
-    return [float(r) for r in rewards]

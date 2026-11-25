@@ -13,6 +13,9 @@ from typing import List
 from typing import Literal
 from typing import Optional
 
+import mlflow
+from mlflow.entities import SpanType
+
 from synalinks.src import tree
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend import DataModel
@@ -22,15 +25,6 @@ from synalinks.src.backend.config import mlflow_experiment_name
 from synalinks.src.backend.config import mlflow_tracking_uri
 from synalinks.src.hooks.hook import Hook
 from synalinks.src.utils.async_utils import run_maybe_nested
-
-try:
-    import mlflow
-    from mlflow.entities import SpanType
-
-    MLFLOW_AVAILABLE = True
-except ImportError:
-    MLFLOW_AVAILABLE = False
-    SpanType = None
 
 # Standard MLflow span attribute keys (`mlflow.tracing.constant`), read by
 # the UI for chat rendering and by the trace-level token/cost roll-ups.
@@ -47,55 +41,6 @@ _USAGE_KEYS = (
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
 )
-
-
-def _chat_messages_of(inputs):
-    """OpenAI-format message list of a `LanguageModel` call's inputs, or `None`."""
-    if not inputs:
-        return None
-    first = inputs[0]
-    if hasattr(first, "get_json"):
-        data = first.get_json()
-    elif isinstance(first, dict):
-        data = first
-    else:
-        return None
-    messages = data.get("messages") if isinstance(data, dict) else None
-    if not isinstance(messages, list):
-        return None
-    return [
-        {k: v for k, v in m.items() if v is not None} if isinstance(m, dict) else m
-        for m in messages
-    ]
-
-
-def _chat_tools_of(kwargs):
-    """Wire tool declarations of a `LanguageModel` call, or an empty list."""
-    tools = []
-    for tool in kwargs.get("tools") or []:
-        try:
-            from synalinks.src.modules.language_models.language_model import _tool_to_wire
-
-            tools.append(_tool_to_wire(tool))
-        except Exception:
-            continue
-    tools.extend(kwargs.get("tool_schemas") or [])
-    return tools
-
-
-def _chat_output_of(serialized_outputs, usage):
-    """OpenAI-style `choices` for a `LanguageModel` span's outputs."""
-    if not serialized_outputs:
-        return None
-    payload = serialized_outputs[0]
-    if isinstance(payload, dict) and "role" in payload:
-        message = {k: v for k, v in payload.items() if v is not None}
-    else:
-        message = {"role": "assistant", "content": json.dumps(payload)}
-    choice = {"index": 0, "message": message}
-    if usage and usage.get("finish_reason"):
-        choice["finish_reason"] = usage["finish_reason"]
-    return [choice]
 
 
 def experiment_id_of(client, name):
@@ -327,11 +272,6 @@ class Monitor(Hook):
         experiment_name=None,
     ):
         super().__init__()
-        if not MLFLOW_AVAILABLE:
-            raise ImportError(
-                "mlflow is required for the Monitor hook. "
-                "Install it with: pip install mlflow"
-            )
 
         # Use provided values or fall back to global config
         self.tracking_uri = tracking_uri or mlflow_tracking_uri()
@@ -354,31 +294,6 @@ class Monitor(Hook):
             mlflow.MlflowClient(), self.experiment_name
         )
         self._setup_done = True
-
-    def _get_span_type(self):
-        """Determine the MLflow span type based on the module class."""
-        if SpanType is None:
-            return None
-
-        module_class = self.module.__class__.__name__
-
-        # Map module types to MLflow span types
-        if module_class == "LanguageModel":
-            return SpanType.CHAT_MODEL
-        elif module_class == "EmbeddingModel":
-            return SpanType.EMBEDDING
-        elif module_class == "DecisionModel":
-            # Same interface as a `LanguageModel` (chat messages in, structured
-            # output out), so it is traced as a chat model too.
-            return SpanType.CHAT_MODEL
-        elif module_class in ("FunctionCallingAgent",):
-            return SpanType.AGENT
-        elif module_class in ("EmbedKnowledge", "RetrieveKnowledge", "UpdateKnowledge"):
-            return SpanType.RETRIEVER
-        elif module_class in ("Tool",):
-            return SpanType.TOOL
-        else:
-            return SpanType.CHAIN
 
     async def _begin_span_async(
         self,
@@ -519,8 +434,20 @@ class Monitor(Hook):
         if self.module.name:
             span_name = f"{span_name}:{self.module.name}"
 
-        # Get the appropriate span type for this module
-        span_type = self._get_span_type()
+        module_class = self.module.__class__.__name__
+        # A `DecisionModel` has the chat model interface, so it is traced as one.
+        if module_class in ("LanguageModel", "DecisionModel"):
+            span_type = SpanType.CHAT_MODEL
+        elif module_class == "EmbeddingModel":
+            span_type = SpanType.EMBEDDING
+        elif module_class == "FunctionCallingAgent":
+            span_type = SpanType.AGENT
+        elif module_class in ("EmbedKnowledge", "RetrieveKnowledge", "UpdateKnowledge"):
+            span_type = SpanType.RETRIEVER
+        elif module_class == "Tool":
+            span_type = SpanType.TOOL
+        else:
+            span_type = SpanType.CHAIN
 
         # Read the ContextVar in the caller's context, not inside the coroutine
         trace_ctx = current_trace_context() or {}
@@ -539,8 +466,31 @@ class Monitor(Hook):
         chat_tools = None
         # A symbolic call has no messages yet, only their schema (in the inputs).
         if span_type == SpanType.CHAT_MODEL and not is_symbolic:
-            chat_messages = _chat_messages_of(inputs)
-            chat_tools = _chat_tools_of(kwargs or {})
+            # OpenAI-format messages of the call's inputs, when there are any.
+            first = inputs[0] if inputs else None
+            if hasattr(first, "get_json"):
+                data = first.get_json()
+            else:
+                data = first if isinstance(first, dict) else None
+            messages = data.get("messages") if isinstance(data, dict) else None
+            if isinstance(messages, list):
+                chat_messages = [
+                    {k: v for k, v in m.items() if v is not None}
+                    if isinstance(m, dict)
+                    else m
+                    for m in messages
+                ]
+            chat_tools = []
+            for tool in (kwargs or {}).get("tools") or []:
+                try:
+                    from synalinks.src.modules.language_models.language_model import (
+                        _tool_to_wire,
+                    )
+
+                    chat_tools.append(_tool_to_wire(tool))
+                except Exception:
+                    continue
+            chat_tools.extend((kwargs or {}).get("tool_schemas") or [])
 
         run_maybe_nested(
             self._begin_span_async(
@@ -613,10 +563,17 @@ class Monitor(Hook):
             span.set_status("OK")
 
         outputs_dict = {"data": serialized_outputs}
-        if usage is not None and exception is None:
-            choices = _chat_output_of(serialized_outputs, usage)
-            if choices is not None:
-                outputs_dict = {"choices": choices, **outputs_dict}
+        if usage is not None and exception is None and serialized_outputs:
+            # OpenAI-style `choices` of a `LanguageModel` span's outputs.
+            payload = serialized_outputs[0]
+            if isinstance(payload, dict) and "role" in payload:
+                message = {k: v for k, v in payload.items() if v is not None}
+            else:
+                message = {"role": "assistant", "content": json.dumps(payload)}
+            choice = {"index": 0, "message": message}
+            if usage and usage.get("finish_reason"):
+                choice["finish_reason"] = usage["finish_reason"]
+            outputs_dict = {"choices": [choice], **outputs_dict}
         if usage and usage.get("answers") is not None:
             # A decision model's raw answers, with probabilities and confidence.
             outputs_dict["answers"] = usage["answers"]
