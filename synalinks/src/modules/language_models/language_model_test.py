@@ -2165,6 +2165,12 @@ class BuildRequestTest(testing.TestCase):
         self.assertEqual(lm.default_kwargs["provider"], {"order": ["acme"]})
         self.assertEqual(tool, _LOOKUP_TOOL)
 
+    async def test_build_request_keeps_a_setting_that_cannot_be_copied(self):
+        lock = threading.Lock()
+        lm = LanguageModel(model="openai/gpt-4o-mini", client=lock)
+        built = await lm.build_request(_question())
+        self.assertIs(built["client"], lock)
+
     async def test_build_request_has_nothing_to_send_without_messages(self):
         lm = LanguageModel(model="openrouter/acme/plain-1")
         self.assertIsNone(await lm.build_request(None))

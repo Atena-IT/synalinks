@@ -1066,6 +1066,8 @@ class OAuthLanguageModel(LanguageModel):
         Returns:
             (dict): The generated structured response.
         """
+        if not messages:
+            return None
         # Refused before the CLI is looked up, as `build_request` refuses it.
         self._check_call(schema, tools, tool_schemas, streaming)
         if self._codex is None:
@@ -1075,20 +1077,21 @@ class OAuthLanguageModel(LanguageModel):
         )
 
     def _check_call(self, schema, tools, tool_schemas, streaming):
-        """Refuse a streamed call and a schema strict mode cannot express.
+        """Refuse a streamed call (a free-form schema: see `_wire_schema`).
 
         Raises:
-            ValueError: If `streaming` is set, if `schema` comes with tools,
-                or if `schema` has a free-form object (see `_strict_schema`).
+            ValueError: If `streaming` is set, or if `schema` comes with tools.
         """
         if streaming:
             raise ValueError("`OAuthLanguageModel` does not support streaming.")
         super()._check_call(schema, tools, tool_schemas, streaming)
-        if schema:
-            _strict_schema(schema)
 
     def _wire_schema(self, schema):
-        """The caller's schema rewritten for strict mode (see `_strict_schema`)."""
+        """The caller's schema rewritten for strict mode (see `_strict_schema`).
+
+        Raises:
+            ValueError: If the schema has a free-form object.
+        """
         return _strict_schema(copy.deepcopy(schema)) if schema else schema
 
     async def _acompletion(self, formatted_messages, **kwargs):

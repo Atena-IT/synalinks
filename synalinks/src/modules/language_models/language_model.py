@@ -148,6 +148,14 @@ _CACHE_CREATION_TTL_KEYS = (
 )
 
 
+def _copy_or_keep(value):
+    """A deep copy of `value`, or `value` itself if it cannot be copied."""
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
+
+
 class _PreparedRequest(NamedTuple):
     """What `LanguageModel._prepare_request` builds for one call."""
 
@@ -954,9 +962,9 @@ class LanguageModel(Module):
         self.last_call_finish_reason = None
         _CURRENT_CALL_USAGE.set(None)
         input_kwargs = copy.deepcopy(kwargs)
-        # The fallback is another model: it gets the caller's schema, not the
-        # one rewritten for this model (`thinking` left out, a `$ref`'s
-        # description dropped).
+        # The fallback is another model: it gets the schema this model takes
+        # (`_wire_schema`), not the one rewritten for this call (`thinking`
+        # left out, a `$ref`'s description dropped).
         input_schema = schema
         prepared = await self._prepare_request(
             messages,
@@ -1023,7 +1031,7 @@ class LanguageModel(Module):
                 self._record_event("fallback_activations")
                 response = await self.fallback(
                     messages,
-                    schema=input_schema,
+                    schema=self._wire_schema(input_schema),
                     tools=tools,
                     tool_schemas=tool_schemas,
                     streaming=streaming,
@@ -1293,14 +1301,14 @@ class LanguageModel(Module):
                 )
                 if self.model.startswith("openrouter"):
                     # Else an endpoint ignoring `response_format` answers in prose.
-                    provider = dict(kwargs.get("provider") or {})
-                    provider.setdefault("require_parameters", True)
+                    routing = dict(kwargs.get("provider") or {})
+                    routing.setdefault("require_parameters", True)
                     chosen = {
                         str(name).lower()
                         for key in ("order", "only")
-                        for name in provider.get(key) or ()
+                        for name in routing.get(key) or ()
                     }
-                    ignored = list(provider.get("ignore") or ())
+                    ignored = list(routing.get("ignore") or ())
                     known = {str(name).lower() for name in ignored}
                     ignored += [
                         name
@@ -1308,8 +1316,8 @@ class LanguageModel(Module):
                         if name not in known and name not in chosen
                     ]
                     if ignored:
-                        provider["ignore"] = ignored
-                    kwargs["provider"] = provider
+                        routing["ignore"] = ignored
+                    kwargs["provider"] = routing
             elif self.model.startswith("gemini"):
                 _set_if_unset(
                     kwargs,
@@ -1399,7 +1407,8 @@ class LanguageModel(Module):
         out. Nothing is sent and the file cache is not read; deferred media
         references (a URL or a path) are left as given, not fetched. The
         request is a copy: changing it changes neither the model's defaults
-        nor the arguments given.
+        nor the arguments given. A setting that cannot be copied (a client,
+        an SSL context) is the object the call would send.
 
         ```python
         import synalinks
@@ -1441,13 +1450,9 @@ class LanguageModel(Module):
             kwargs,
             resolve_media=False,
         )
-        return copy.deepcopy(
-            {
-                "model": self.model,
-                "messages": prepared.messages,
-                **prepared.kwargs,
-            }
-        )
+        request = {"model": self.model, "messages": prepared.messages}
+        request.update(prepared.kwargs)
+        return {key: _copy_or_keep(value) for key, value in request.items()}
 
     def _check_call(self, schema, tools, tool_schemas, streaming):
         """Refuse a call this model cannot make, before anything is built.
