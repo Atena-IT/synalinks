@@ -38,9 +38,11 @@ def default_deep_agent_judge_instructions(score_type=Rating20, workdir=None):
         get_default_instructions(resolve_workdir(workdir))
         + "\n\n"
         + "You are an impartial judge. The `InputsSummary` describes the "
-        "prediction to grade and, when a reference is available, the expected "
-        "values under keys prefixed with `gold_`; the full values are in the "
-        "JSON file named in its `inputs_file` field. Use the tools to verify the "
+        "program's input under keys prefixed with `input_`, the prediction to "
+        "grade under keys prefixed with `output_` and, when a "
+        "reference is available, the expected values under keys prefixed with "
+        "`gold_`; the full values are in the JSON file named in its "
+        "`inputs_file` field. Use the tools to verify the "
         "prediction against reality (read the inputs file, run the predicted "
         "code or the project's tests with `run_bash`, diff the prediction "
         "against the `gold_` fields) instead of trusting your first impression. "
@@ -168,14 +170,14 @@ class DeepAgentAsJudgeProgram(Program):
             reset_sandbox = sandbox is None
         self.reset_sandbox = reset_sandbox
 
-    async def call(self, inputs):
+    async def call(self, inputs, x=None):
         y_pred = (
             inputs[1] if isinstance(inputs, (list, tuple)) and len(inputs) == 2 else None
         )
         # A fresh workspace per graded sample; symbolic builds never run tools.
         if self.reset_sandbox and y_pred and not is_symbolic_data_model(y_pred):
             self.agent.sandbox.reset()
-        return await judge_with_agent(self.agent, self.score_type, inputs)
+        return await judge_with_agent(self.agent, self.score_type, inputs, x=x)
 
     def get_config(self):
         config = {

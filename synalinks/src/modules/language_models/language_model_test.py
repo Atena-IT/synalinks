@@ -10,7 +10,6 @@ from http.server import BaseHTTPRequestHandler
 from http.server import HTTPServer
 from unittest.mock import patch
 
-import litellm
 from litellm.types.utils import Choices
 from litellm.types.utils import CompletionTokensDetailsWrapper
 from litellm.types.utils import Message
@@ -562,27 +561,11 @@ class LanguageModelTest(testing.TestCase):
             kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"], False
         )
 
-        with self.assertWarns(DeprecationWarning):
+        # "disable" is the same as "none", without a warning.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
             await lm(messages, reasoning_effort="disable")
         self.assertEqual(mock_completion.call_args.kwargs, kwargs)
-
-    @patch("litellm.acompletion")
-    async def test_unsupported_reasoning_level_rounds_down(self, mock_completion):
-        mock_completion.return_value = {"choices": [{"message": {"content": "ok"}}]}
-        messages = ChatMessages(
-            messages=[ChatMessage(role=ChatRole.USER, content="Hello")]
-        )
-        lm = LanguageModel(model="openai/o-test", supports_reasoning=True)
-        table = {"openai/o-test": {"reasoning_effort_levels": ["low", "high"]}}
-        with patch.dict(litellm.model_cost, table):
-            for asked, sent in [("xhigh", "high"), ("medium", "low"), ("minimal", "low")]:
-                with self.assertWarns(UserWarning):
-                    await lm(messages, reasoning_effort=asked)
-                self.assertEqual(
-                    mock_completion.call_args.kwargs["reasoning_effort"], sent
-                )
-            await lm(messages, reasoning_effort="high")
-            self.assertEqual(mock_completion.call_args.kwargs["reasoning_effort"], "high")
 
     @patch("litellm.acompletion")
     async def test_reasoning_effort_none_noop_for_non_ollama(self, mock_completion):
@@ -597,6 +580,37 @@ class LanguageModelTest(testing.TestCase):
         lm = LanguageModel(model="openai/gpt-4o-mini")
         await lm(messages, reasoning_effort="none")
         self.assertNotIn("think", mock_completion.call_args.kwargs)
+
+    @patch("litellm.acompletion")
+    async def test_level_litellm_would_drop_goes_to_the_provider(self, mock_completion):
+        # drop_params drops gpt-5's "xhigh" (not in litellm's table): sent anyway.
+        mock_completion.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        messages = ChatMessages(
+            messages=[ChatMessage(role=ChatRole.USER, content="Hello")]
+        )
+        lm = LanguageModel(model="openai/gpt-5", supports_reasoning=True)
+        for level in ("minimal", "high", "max"):
+            await lm(messages, reasoning_effort=level)
+            self.assertEqual(mock_completion.call_args.kwargs["reasoning_effort"], level)
+        await lm(messages, reasoning_effort="xhigh")
+        kwargs = mock_completion.call_args.kwargs
+        self.assertNotIn("reasoning_effort", kwargs)
+        self.assertEqual(kwargs["extra_body"], {"reasoning_effort": "xhigh"})
+
+    @patch("litellm.acompletion")
+    async def test_level_litellm_refuses_goes_to_the_provider(self, mock_completion):
+        # litellm validates Gemini's levels and raises on "xhigh": it is sent anyway.
+        mock_completion.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        messages = ChatMessages(
+            messages=[ChatMessage(role=ChatRole.USER, content="Hello")]
+        )
+        lm = LanguageModel(model="gemini/gemini-2.5-flash", supports_reasoning=True)
+        await lm(messages, reasoning_effort="xhigh")
+        kwargs = mock_completion.call_args.kwargs
+        self.assertNotIn("reasoning_effort", kwargs)
+        self.assertEqual(kwargs["extra_body"], {"reasoning_effort": "xhigh"})
+        await lm(messages, reasoning_effort="high")
+        self.assertEqual(mock_completion.call_args.kwargs["reasoning_effort"], "high")
 
     @patch("litellm.acompletion")
     async def test_reasoning_effort_disable_sends_each_providers_off_switch(

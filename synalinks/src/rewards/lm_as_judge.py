@@ -1,6 +1,5 @@
 # License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
-from synalinks.src import ops
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend.pydantic.metrics import FineScore
 from synalinks.src.backend.pydantic.metrics import get_score_type
@@ -8,8 +7,11 @@ from synalinks.src.backend.pydantic.metrics import serialize_score_type
 from synalinks.src.modules import SelfCritique
 from synalinks.src.modules import language_models
 from synalinks.src.modules.ttc.self_critique import CritiqueWithReward
+from synalinks.src.modules.ttc.self_critique import default_critique_instructions
 from synalinks.src.programs import Program
+from synalinks.src.rewards.reward_wrappers import JUDGE_INPUTS_DESCRIPTION
 from synalinks.src.rewards.reward_wrappers import ProgramAsJudge
+from synalinks.src.rewards.reward_wrappers import judge_inputs
 from synalinks.src.saving import serialization_lib
 
 
@@ -48,6 +50,11 @@ class LMAsJudgeProgram(Program):
         )
         self.score_type = get_score_type(score_type or FineScore)
         # A language model judge: its critique never uses a decision model.
+        if instructions is None:
+            instructions = (
+                f"{default_critique_instructions(self.score_type)} "
+                f"{JUDGE_INPUTS_DESCRIPTION}"
+            )
         self.critique = SelfCritique(
             language_model=language_models.get(language_model),
             prompt_template=prompt_template,
@@ -61,13 +68,12 @@ class LMAsJudgeProgram(Program):
         self.examples = examples
         self.instructions = instructions
 
-    async def call(self, inputs):
+    async def call(self, inputs, x=None):
         if not isinstance(inputs, (list, tuple)):
             raise ValueError("The inputs should be a list or tuple.")
         if len(inputs) != 2:
-            raise ValueError("The inputs of the program should have a length of 2.")
-        y_true = inputs[0]
-        y_pred = inputs[1]
+            raise ValueError("The inputs of the program should be `[y_true, y_pred]`.")
+        y_true, y_pred = inputs
         if not y_pred:
             # No prediction to judge; return a reward-bearing data model
             # (the `ProgramAsJudge` contract) rather than a bare float, which
@@ -76,21 +82,7 @@ class LMAsJudgeProgram(Program):
                 critique="Empty prediction: nothing to evaluate.",
                 reward=0.0,
             ).to_json_data_model()
-        if y_true:
-            y_true = await ops.prefix(
-                y_true,
-                prefix="gold",
-                name="gold_y_true",
-            )
-            return await self.critique(
-                await ops.concat(
-                    y_true,
-                    y_pred,
-                    name="y_true_with_y_pred",
-                )
-            )
-        else:
-            return await self.critique(y_pred)
+        return await self.critique(await judge_inputs(y_true, y_pred, x))
 
     def get_config(self):
         config = {

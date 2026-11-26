@@ -8,8 +8,10 @@ from synalinks.src import ops
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend.common import numpy as np
 from synalinks.src.metrics.metric import apply_masks
+from synalinks.src.metrics.metric import mask_data_models
 from synalinks.src.saving.synalinks_saveable import SynalinksSaveable
 from synalinks.src.utils.naming import auto_name
+from synalinks.src.utils.python_utils import accepts_argument
 
 
 @synalinks_export(["synalinks.Reward", "synalinks.rewards.Reward"])
@@ -43,7 +45,9 @@ class Reward(SynalinksSaveable):
     To be implemented by subclasses:
 
     * `call()`: Contains the logic for eval calculation using `y_true`,
-        `y_pred`.
+        `y_pred`. A `call()` that also declares an `x` argument (or takes
+        `**kwargs`) receives the program's inputs, masked like the targets, or
+        `None` when they are not given.
     """
 
     def __init__(
@@ -62,7 +66,7 @@ class Reward(SynalinksSaveable):
         self.in_mask_pattern = in_mask_pattern
         self.out_mask_pattern = out_mask_pattern
 
-    async def __call__(self, y_true, y_pred):
+    async def __call__(self, y_true, y_pred, x=None):
         with ops.name_scope(self.name):
             y_true, y_pred = apply_masks(
                 y_true,
@@ -72,7 +76,17 @@ class Reward(SynalinksSaveable):
                 out_mask=self.out_mask,
                 out_mask_pattern=self.out_mask_pattern,
             )
-            rewards = await self.call(y_true, y_pred)
+            if accepts_argument(self.call, "x"):
+                x = mask_data_models(
+                    x,
+                    in_mask=self.in_mask,
+                    in_mask_pattern=self.in_mask_pattern,
+                    out_mask=self.out_mask,
+                    out_mask_pattern=self.out_mask_pattern,
+                )
+                rewards = await self.call(y_true, y_pred, x=x)
+            else:
+                rewards = await self.call(y_true, y_pred)
             return reduce_values(
                 rewards,
                 reduction=self.reduction,
