@@ -5,7 +5,6 @@ import re
 
 from pydantic import field_validator
 
-from synalinks.src import ops
 from synalinks.src.api_export import synalinks_export
 from synalinks.src.backend import DataModel
 from synalinks.src.backend import Field
@@ -23,7 +22,9 @@ from synalinks.src.modules import Module
 from synalinks.src.modules.decision_models import resolve_decision_model
 from synalinks.src.modules.decision_models.decision_model import score_schema
 from synalinks.src.modules.ttc.self_critique import CritiqueWithReward
+from synalinks.src.rewards.reward_wrappers import JUDGE_INPUTS_DESCRIPTION
 from synalinks.src.rewards.reward_wrappers import ProgramAsJudge
+from synalinks.src.rewards.reward_wrappers import judge_inputs
 from synalinks.src.rewards.rubrics import get_rubric
 from synalinks.src.saving import serialization_lib
 from synalinks.src.utils.naming import to_snake_case
@@ -34,12 +35,14 @@ DEFAULT_INSTRUCTIONS = (
     "Your task is to grade the given answer against each criterion in "
     "<rubrics>, independently. Score every criterion on its own merits, "
     "using the scale in <score_scale>, then write a critique naming the "
-    "criteria that lost points and why. Grade only these criteria."
+    "criteria that lost points and why. Grade only these criteria. "
+    + JUDGE_INPUTS_DESCRIPTION
 )
 
 
 DEFAULT_DECISION_MODEL_INSTRUCTIONS = (
-    "Your task is to grade the given answer against each criterion, independently."
+    "Your task is to grade the given answer against each criterion, "
+    "independently. " + JUDGE_INPUTS_DESCRIPTION
 )
 
 # The levels a decision model grades each criterion on, from the lowest reward
@@ -323,23 +326,18 @@ class RubricsAsJudgeProgram(Module):
             name="generator_" + self.name,
         )
 
-    async def call(self, inputs):
+    async def call(self, inputs, x=None):
         if not isinstance(inputs, (list, tuple)):
             raise ValueError("The inputs should be a list or tuple.")
         if len(inputs) != 2:
-            raise ValueError("The inputs of the program should have a length of 2.")
+            raise ValueError("The inputs of the program should be `[y_true, y_pred]`.")
         y_true, y_pred = inputs
         if not y_pred:
             return CritiqueWithReward(
                 critique="Empty prediction: nothing to evaluate.", reward=0.0
             ).to_json_data_model()
 
-        if y_true:
-            y_true = await ops.prefix(y_true, prefix="gold", name="gold_y_true")
-            inputs = await ops.concat(y_true, y_pred, name="y_true_with_y_pred")
-        else:
-            inputs = y_pred
-        grades = await self.generator(inputs)
+        grades = await self.generator(await judge_inputs(y_true, y_pred, x))
         if grades is None:
             return CritiqueWithReward(
                 critique="The judge produced no grade sheet.", reward=0.0

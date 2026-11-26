@@ -107,9 +107,11 @@ def default_rlm_judge_instructions(
     return (
         base
         + "\n\n"
-        + "You are an impartial judge. The `inputs` dict holds the prediction to "
-        "grade and, when a reference is available, the expected values under "
-        "keys prefixed with `gold_`. Use the sandbox to verify the prediction "
+        + "You are an impartial judge. The `inputs` dict holds the program's "
+        "input under keys prefixed with `input_`, the prediction to grade under "
+        "keys prefixed with `output_` and, when a reference is "
+        "available, the expected values under keys prefixed with `gold_`. Use "
+        "the sandbox to verify the prediction "
         f"against reality ({verify}) instead of trusting your first impression. "
         "Once you have enough evidence, call "
         '`submit(result={"critique": ..., "reward": ...})` with an elaborated '
@@ -251,8 +253,8 @@ class RLMAsJudgeProgram(Program):
         self.sandbox = sandbox
         self.sandbox_type = self.agent.sandbox_type
 
-    async def call(self, inputs):
-        return await judge_with_agent(self.agent, self.score_type, inputs)
+    async def call(self, inputs, x=None):
+        return await judge_with_agent(self.agent, self.score_type, inputs, x=x)
 
     def get_config(self):
         config = {

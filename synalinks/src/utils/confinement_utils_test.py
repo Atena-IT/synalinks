@@ -23,7 +23,10 @@ class ConfinementProbeTest(testing.TestCase):
         super().tearDown()
 
     def probe(self, *exit_codes):
-        """Run `confinement_available` once per exit code of the probe, the host's checks faked to pass."""
+        """Run `confinement_available` once per probe exit code.
+
+        The host's other checks are faked to pass.
+        """
         codes = iter(exit_codes)
 
         def no_userns_switch(path, *args, **kwargs):

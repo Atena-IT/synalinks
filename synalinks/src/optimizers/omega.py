@@ -261,24 +261,6 @@ async def _candidate_vector(candidate, embedding_model, axis=-1):
     return mean / norm
 
 
-def _without_echoed_inputs(predicted_output, inputs):
-    """Drop from a prediction the fields that merely repeat the input.
-
-    Modules that return their inputs concatenated with their outputs (e.g.
-    `SelfCritique`, `Generator(return_inputs=True)`) would otherwise show every
-    sample twice to the mutation/crossover programs. Only fields whose value is
-    identical to the input's are removed, so genuine outputs are kept even when
-    they share a key name with an input field.
-    """
-    if not isinstance(predicted_output, dict) or not isinstance(inputs, dict):
-        return predicted_output
-    return {
-        key: value
-        for key, value in predicted_output.items()
-        if not (key in inputs and inputs[key] == value)
-    }
-
-
 @synalinks_export(
     [
         "synalinks.OMEGA",
@@ -624,7 +606,7 @@ class OMEGA(EvolutionaryOptimizer):
                 entry = {"key": key, "inputs": inputs, "rewards": []}
                 entries.append(entry)
                 by_key[key] = entry
-            entry["last_output"] = _without_echoed_inputs(predicted, inputs)
+            entry["last_output"] = predicted
             entry["ground_truth"] = target
             entry["rewards"].append(float(rewards[i]))
 
@@ -693,7 +675,7 @@ class OMEGA(EvolutionaryOptimizer):
             scored.append(
                 {
                     "inputs": inputs,
-                    "predicted_output": _without_echoed_inputs(predicted, inputs),
+                    "predicted_output": predicted,
                     "ground_truth": as_json(y[i]) if i < len(y) else None,
                     "reward": None if reward is None else float(reward),
                     "nb_observations": None,

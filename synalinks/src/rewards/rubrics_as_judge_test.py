@@ -1,6 +1,5 @@
 # License Apache 2.0: (c) 2025-2026 Yoan Sallami (Synalinks Team)
 
-import json
 import os
 from unittest.mock import patch
 
@@ -165,9 +164,9 @@ class RubricsAsJudgeTest(testing.TestCase):
         score = await reward(y_true=None, y_pred=Answer(answer="Paris"))
         self.assertEqual(score, 1.0)
         # Without a reference the judge only sees the prediction: no `gold_` key.
-        prompt = json.dumps(mock_completion.call_args.kwargs["messages"])
-        self.assertNotIn("gold_", prompt)
-        self.assertIn("Paris", prompt)
+        data = mock_completion.call_args.kwargs["messages"][-1]["content"]
+        self.assertNotIn("gold_", data)
+        self.assertIn("Paris", data)
 
     @patch("litellm.acompletion")
     async def test_rubrics_as_judge_incomplete_grade_sheet(self, mock_completion):
@@ -219,7 +218,7 @@ class RubricsAsJudgeTest(testing.TestCase):
 
         with self.assertRaisesRegex(ValueError, "list or tuple"):
             await reward.program(Answer(answer="Paris"))
-        with self.assertRaisesRegex(ValueError, "length of 2"):
+        with self.assertRaisesRegex(ValueError, r"\[y_true, y_pred\]"):
             await reward.program([Answer(answer="Paris")])
 
     async def test_rubrics_as_judge_symbolic_output_schema(self):
@@ -264,6 +263,34 @@ class RubricsAsJudgeTest(testing.TestCase):
         self.assertIs(restored.program.score_type, Rating)
         self.assertEqual(restored.program.rubrics[0].name, "correct")
         self.assertEqual(restored.program.rubrics[0].weight, 2.0)
+
+    @patch("litellm.acompletion")
+    async def test_rubrics_as_judge_sees_the_program_inputs(self, mock_completion):
+        # Rubrics such as relevancy grade the answer against the question.
+        class Query(DataModel):
+            query: str = Field(description="The query")
+
+        class Answer(DataModel):
+            answer: str = Field(description="The answer")
+
+        reward = RubricsAsJudge(
+            language_model=LanguageModel(model="ollama/mistral"),
+            rubrics=[{"name": "relevant", "description": "Answers the query."}],
+            score_type=Rating,
+        )
+        mock_completion.return_value = {
+            "choices": [{"message": {"content": '{"critique": "Ok.", "relevant": 5}'}}]
+        }
+        score = await reward(
+            y_true=None,
+            y_pred=Answer(answer="Paris"),
+            x=Query(query="French capital?"),
+        )
+        self.assertEqual(score, 1.0)
+        self.assertEqual(
+            mock_completion.call_args.kwargs["messages"][-1]["content"],
+            "{'input_query': 'French capital?', 'output_answer': 'Paris'}",
+        )
 
 
 def score_answer(score, confidence=0.9):
